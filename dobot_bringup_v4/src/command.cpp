@@ -36,6 +36,11 @@ void CRCommanderRos2::getToolVectorActual(double *val)
 
 void CRCommanderRos2::recvTask()
 {
+    // Edge-triggered logging for the realtime link: when the controller is off,
+    // the recv times out (or the reconnect fails) on every loop iteration, which
+    // otherwise floods the log. Log the transition to unhealthy once, and the
+    // recovery once, so each failure/recovery cycle is at most two lines.
+    bool realtime_healthy = true;
     while (is_running_)
     {
         if (real_time_tcp_->isConnect())
@@ -45,6 +50,11 @@ void CRCommanderRos2::recvTask()
                 RealTimeData packet;
                 if (real_time_tcp_->tcpRecvExact(&packet, sizeof(RealTimeData), 5000))
                 {
+                    if (!realtime_healthy)
+                    {
+                        RCLCPP_INFO(kLogger, "tcp recv recovered");
+                        realtime_healthy = true;
+                    }
                     if (packet.len != sizeof(RealTimeData))
                     {
                         RCLCPP_WARN_ONCE(kLogger,
@@ -57,15 +67,20 @@ void CRCommanderRos2::recvTask()
                         *real_time_data_ = packet;
                     }
                 }
-                else
+                else if (realtime_healthy)
                 {
-                    RCLCPP_WARN(kLogger, "tcp recv timeout");
+                    RCLCPP_WARN(kLogger, "tcp recv timeout (controller unreachable? suppressing until recovery)");
+                    realtime_healthy = false;
                 }
             }
             catch (const TcpClientException &err)
             {
                 real_time_tcp_->disConnect();
-                RCLCPP_ERROR(kLogger, "tcp recv error: %s", err.what());
+                if (realtime_healthy)
+                {
+                    RCLCPP_ERROR(kLogger, "tcp recv error: %s", err.what());
+                    realtime_healthy = false;
+                }
             }
         }
         else
@@ -76,7 +91,11 @@ void CRCommanderRos2::recvTask()
             }
             catch (const TcpClientException &err)
             {
-                RCLCPP_ERROR(kLogger, "realtime tcp connect failed: %s", err.what());
+                if (realtime_healthy)
+                {
+                    RCLCPP_ERROR(kLogger, "realtime tcp connect failed: %s", err.what());
+                    realtime_healthy = false;
+                }
                 sleep(3);
             }
         }
