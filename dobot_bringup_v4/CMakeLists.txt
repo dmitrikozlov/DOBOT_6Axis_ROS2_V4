@@ -81,5 +81,18 @@ if(BUILD_TESTING)
     "dobot_msgs_v4"
   )
   target_link_libraries(test_trajectory_executor pthread)
+
+  ament_add_gtest(test_tcp_reconnect
+    test/test_tcp_reconnect.cpp
+    src/command.cpp
+    src/tcp_socket.cpp
+  )
+  target_include_directories(test_tcp_reconnect PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_target_dependencies(test_tcp_reconnect
+    "rclcpp"
+  )
+  target_link_libraries(test_tcp_reconnect pthread)
 endif()
 ament_package()

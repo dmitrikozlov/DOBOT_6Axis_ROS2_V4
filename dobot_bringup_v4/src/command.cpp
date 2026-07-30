@@ -5,6 +5,10 @@
 
 static const rclcpp::Logger kLogger = rclcpp::get_logger("dobot_tcp");
 static constexpr uint32_t kRecvBufSize = 1024;
+// The controller pushes a realtime packet every ~8 ms, so a second of silence is
+// already abnormal and three consecutive misses mean the link is gone.
+static constexpr uint32_t kRealtimeRecvTimeoutMs = 1000;
+static constexpr int kRealtimeMaxTimeouts = 3;
 
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : is_running_(false)
@@ -41,6 +45,8 @@ void CRCommanderRos2::recvTask()
     // otherwise floods the log. Log the transition to unhealthy once, and the
     // recovery once, so each failure/recovery cycle is at most two lines.
     bool realtime_healthy = true;
+    bool dashboard_healthy = true;
+    int realtime_timeouts = 0;
     while (is_running_)
     {
         if (real_time_tcp_->isConnect())
@@ -48,8 +54,9 @@ void CRCommanderRos2::recvTask()
             try
             {
                 RealTimeData packet;
-                if (real_time_tcp_->tcpRecvExact(&packet, sizeof(RealTimeData), 5000))
+                if (real_time_tcp_->tcpRecvExact(&packet, sizeof(RealTimeData), kRealtimeRecvTimeoutMs))
                 {
+                    realtime_timeouts = 0;
                     if (!realtime_healthy)
                     {
                         RCLCPP_INFO(kLogger, "tcp recv recovered");
@@ -67,15 +74,29 @@ void CRCommanderRos2::recvTask()
                         *real_time_data_ = packet;
                     }
                 }
-                else if (realtime_healthy)
+                else if (++realtime_timeouts >= kRealtimeMaxTimeouts)
                 {
-                    RCLCPP_WARN(kLogger, "tcp recv timeout (controller unreachable? suppressing until recovery)");
-                    realtime_healthy = false;
+                    // A restarting controller usually leaves this socket half-open
+                    // (it never gets to send a FIN), so recv only ever times out and
+                    // the connection stays nominally "up" forever. Drop it so the
+                    // reconnect branch below can re-establish it — without this the
+                    // node had to be restarted by hand. This also resynchronises the
+                    // packet framing, which a partial read leaves misaligned.
+                    if (realtime_healthy)
+                    {
+                        RCLCPP_WARN(kLogger,
+                            "tcp recv timeout (controller restarted?) — dropping realtime "
+                            "link and reconnecting; suppressing until recovery");
+                        realtime_healthy = false;
+                    }
+                    real_time_tcp_->disConnect();
+                    realtime_timeouts = 0;
                 }
             }
             catch (const TcpClientException &err)
             {
                 real_time_tcp_->disConnect();
+                realtime_timeouts = 0;
                 if (realtime_healthy)
                 {
                     RCLCPP_ERROR(kLogger, "tcp recv error: %s", err.what());
@@ -102,16 +123,29 @@ void CRCommanderRos2::recvTask()
 
         if (!dash_board_tcp_->isConnect())
         {
-            try
+            // Reconnect under dash_mutex_: a concurrent service call or servo command
+            // would otherwise send on the fd while it is being swapped underneath it.
+            bool connect_failed = false;
             {
-                dash_board_tcp_->connect();
+                std::lock_guard<std::mutex> lock(dash_mutex_);
+                try
+                {
+                    dash_board_tcp_->connect();
+                    dashboard_healthy = true;
+                }
+                catch (const TcpClientException &err)
+                {
+                    if (dashboard_healthy)
+                    {
+                        RCLCPP_ERROR(kLogger, "dashboard tcp connect failed: %s (suppressing until recovery)",
+                                     err.what());
+                        dashboard_healthy = false;
+                    }
+                    connect_failed = true;
+                }
             }
-            catch (const TcpClientException &err)
-            {
-
-                RCLCPP_ERROR(kLogger, "dashboard tcp connect failed: %s", err.what());
-                sleep(3);
-            }
+            if (connect_failed)
+                sleep(3);  // outside the lock: don't stall service calls on a doomed link
         }
     }
 }
@@ -156,7 +190,12 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
             {
                 if (std::chrono::steady_clock::now() > deadline)
                 {
-                    RCLCPP_ERROR(kLogger, "doTcpCmd: response timeout for: %s", cmd);
+                    // Either the link is half-open (controller restarted) or the
+                    // command/response stream has lost sync — a late reply would be
+                    // read as the *next* command's. Both are only fixable by
+                    // reconnecting, which recvTask does once the socket is down.
+                    RCLCPP_ERROR(kLogger, "doTcpCmd: response timeout for: %s — dropping dashboard link", cmd);
+                    tcp->disConnect();
                     err_id = -1;
                     return;
                 }
@@ -211,7 +250,8 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
             {
                 if (std::chrono::steady_clock::now() > deadline)
                 {
-                    RCLCPP_ERROR(kLogger, "doTcpCmd_f: response timeout for: %s", cmd);
+                    RCLCPP_ERROR(kLogger, "doTcpCmd_f: response timeout for: %s — dropping dashboard link", cmd);
+                    tcp->disConnect();
                     err_id = -1;
                     return;
                 }
@@ -322,7 +362,8 @@ bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id)
             {
                 if (std::chrono::steady_clock::now() > deadline)
                 {
-                    RCLCPP_ERROR(kLogger, "sendServoCommand: response timeout");
+                    RCLCPP_ERROR(kLogger, "sendServoCommand: response timeout — dropping dashboard link");
+                    dash_board_tcp_->disConnect();
                     err_id = -1;
                     return false;
                 }

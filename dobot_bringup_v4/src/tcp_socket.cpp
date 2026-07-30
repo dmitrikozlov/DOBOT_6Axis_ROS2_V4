@@ -1,5 +1,6 @@
 #include <dobot_bringup/tcp_socket.h>
 #include <rclcpp/rclcpp.hpp>
+#include <netinet/tcp.h>
 
 TcpClient::TcpClient(std::string ip, uint16_t port) : fd_(-1), port_(port), ip_(std::move(ip)), is_connected_(false)
 {
@@ -13,21 +14,31 @@ TcpClient::~TcpClient()
 void TcpClient::close()
 {
     if (fd_ >= 0)
-    {
         ::close(fd_);
-        is_connected_ = false;
-        fd_ = -1;
-    }
+    fd_ = -1;
+    is_connected_ = false;
 }
 
 void TcpClient::connect()
 {
+    // Always start from a fresh socket. A TCP socket whose ::connect() failed is
+    // spent: further attempts on the same fd fail permanently (EINVAL /
+    // ECONNABORTED), so reusing it wedged the reconnect loop for the lifetime of
+    // the process once a single attempt had missed — which is exactly what
+    // happens while the controller is rebooting.
+    close();
+
+    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0)
-    {
-        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd_ < 0)
-            throw TcpClientException(toString() + std::string(" socket : ") + strerror(errno));
-    }
+        throw TcpClientException(toString() + std::string(" socket : ") + strerror(errno));
+
+#ifdef TCP_SYNCNT
+    // Bound the SYN retries so an attempt against a powered-off controller fails
+    // in seconds rather than the ~2 min kernel default, keeping the retry cadence
+    // (and therefore recovery latency) predictable.
+    int syn_retries = 2;
+    ::setsockopt(fd_, IPPROTO_TCP, TCP_SYNCNT, &syn_retries, sizeof(syn_retries));
+#endif
 
     sockaddr_in addr = {};
 
@@ -37,7 +48,11 @@ void TcpClient::connect()
     addr.sin_port = htons(port_);
 
     if (::connect(fd_, (sockaddr *)&addr, sizeof(addr)) < 0)
-        throw TcpClientException(toString() + std::string(" connect : ") + strerror(errno));
+    {
+        std::string what = toString() + std::string(" connect : ") + strerror(errno);
+        close();
+        throw TcpClientException(what);
+    }
     is_connected_ = true;
 
     RCLCPP_INFO(rclcpp::get_logger("dobot_tcp"), "connected to %s", toString().c_str());
@@ -45,12 +60,9 @@ void TcpClient::connect()
 
 void TcpClient::disConnect()
 {
-    if (is_connected_)
-    {
-        fd_ = -1;
-        is_connected_ = false;
-        ::close(fd_);
-    }
+    // Previously cleared fd_ *before* ::close(fd_), so it closed -1 and leaked the
+    // real descriptor on every disconnect.
+    close();
 }
 
 bool TcpClient::isConnect() const
