@@ -131,7 +131,15 @@ void CRCommanderRos2::recvTask()
                 try
                 {
                     dash_board_tcp_->connect();
-                    dashboard_healthy = true;
+                    // Edge-triggered, like the failure below: the operator has to
+                    // learn the link came back, or the single "connect failed"
+                    // line stands unanswered forever and every later log is read
+                    // as if the arm were still unreachable.
+                    if (!dashboard_healthy)
+                    {
+                        RCLCPP_INFO(kLogger, "dashboard tcp connection restored");
+                        dashboard_healthy = true;
+                    }
                 }
                 catch (const TcpClientException &err)
                 {
