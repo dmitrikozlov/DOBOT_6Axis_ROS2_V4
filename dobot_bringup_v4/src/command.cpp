@@ -229,7 +229,16 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     }
     catch (const std::logic_error &err)
     {
+        // A command that never left the host must not be reported as executed.
+        // err_id is pre-set to 0 above, and leaving it there on a send failure
+        // ("tcp is disconnected", after the controller was power-cycled) told
+        // every ROS caller res=0 = success. Callers then built on a command that
+        // did nothing — e.g. the tool-485 init (SetToolPower/SetToolMode/
+        // SetTool485) "succeeded" while the dashboard link was down, so the
+        // gripper's bridge socket was opened onto an unconfigured tool port and
+        // every Modbus transaction timed out from then on.
         RCLCPP_ERROR(kLogger, "tcpDoCmd failed: %s", err.what());
+        err_id = -1;
     }
 }
 
@@ -295,7 +304,9 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     }
     catch (const std::logic_error &err)
     {
+        // Report the failure instead of the pre-set err_id = 0 — see doTcpCmd.
         RCLCPP_ERROR(kLogger, "tcpDoCmd failed: %s", err.what());
+        err_id = -1;
     }
 }
 
