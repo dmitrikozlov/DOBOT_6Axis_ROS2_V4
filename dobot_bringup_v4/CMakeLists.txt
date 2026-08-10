@@ -94,5 +94,18 @@ if(BUILD_TESTING)
     "rclcpp"
   )
   target_link_libraries(test_tcp_reconnect pthread)
+
+  ament_add_gtest(test_tcp_response
+    test/test_tcp_response.cpp
+    src/command.cpp
+    src/tcp_socket.cpp
+  )
+  target_include_directories(test_tcp_response PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  ament_target_dependencies(test_tcp_response
+    "rclcpp"
+  )
+  target_link_libraries(test_tcp_response pthread)
 endif()
 ament_package()

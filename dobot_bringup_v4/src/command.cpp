@@ -173,6 +173,71 @@ void CRCommanderRos2::init()
 int stringToInt(const std::string& str) {
     return std::atoi(str.c_str());
 }
+
+namespace
+{
+// How long a dashboard command waits for its ';'-terminated reply, and how long
+// each individual recv blocks while waiting.
+constexpr auto kResponseTimeout = std::chrono::seconds(2);
+constexpr uint32_t kResponsePollMs = 100;
+
+/// Read one ';'-terminated dashboard response into `buf`, which is left NUL
+/// terminated. Returns false — after dropping the link — when no complete
+/// response arrives in time, or when one overruns the buffer with no terminator.
+///
+/// Both failures leave the byte stream unusable: a reply that shows up late is
+/// read as the NEXT command's response, and every result after that is offset by
+/// one. Dropping the socket is what forces recvTask to reconnect and resynchronise.
+///
+/// The deadline is checked at the TOP of every iteration, not only when tcpRecv
+/// reports a timeout. That distinction is the whole point of this helper:
+/// tcpRecv returns *true* with has_read == 0 once the buffer is full (its
+/// `while (len)` loop never runs), so a deadline confined to the !ok branch spins
+/// forever — while holding dash_mutex_. The node stays alive, keeps its topics,
+/// and silently stops answering every service call.
+bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
+                  const char *fn, const char *cmd)
+{
+    char *recv_ptr = buf;
+    const auto deadline = std::chrono::steady_clock::now() + kResponseTimeout;
+
+    while (true)
+    {
+        if (std::chrono::steady_clock::now() > deadline)
+        {
+            RCLCPP_ERROR(kLogger, "%s: response timeout for: %s — dropping dashboard link", fn, cmd);
+            tcp->disConnect();
+            return false;
+        }
+
+        // Reserve the last byte so buf stays NUL terminated for strchr()/"%s".
+        const uint32_t space = buf_size - 1 - static_cast<uint32_t>(recv_ptr - buf);
+        if (space == 0)
+        {
+            RCLCPP_ERROR(kLogger, "%s: response exceeded %u bytes with no ';' for: %s — dropping dashboard link",
+                         fn, buf_size - 1, cmd);
+            tcp->disConnect();
+            return false;
+        }
+
+        // tcpRecv returns false when select() times out — but it may already have
+        // read part of the reply, and has_read reports how much. Advance by
+        // has_read regardless: treating a partial read as "no progress" leaves the
+        // bytes in place and lets the next read overwrite them from the start, so a
+        // reply split across TCP segments ("0,{5},Robot" then "Mode();") assembles
+        // as "Mode();obot". Genuine socket errors throw, so has_read is enough to
+        // drive the loop and the bool carries no information we need.
+        uint32_t has_read = 0;
+        (void)tcp->tcpRecv(recv_ptr, space, has_read, kResponsePollMs);
+        if (has_read == 0)
+            continue;  // nothing arrived this round; the deadline above bounds the wait
+
+        recv_ptr += has_read;
+        if (*(recv_ptr - 1) == ';')
+            return true;
+    }
+}
+}  // namespace
 void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,
                                std::vector<std::string> &result)
 {
@@ -180,7 +245,6 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
     err_id = 0;
     try
     {
-        uint32_t has_read;
         char buf[kRecvBufSize];
         memset(buf, 0, sizeof(buf));
         auto currentTime = std::chrono::system_clock::now();
@@ -189,30 +253,14 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
         RCLCPP_INFO(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
 
         tcp->tcpSend(cmd, strlen(cmd));
-        char *recv_ptr = buf;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (true)
+        // Either the link is half-open (controller restarted) or the command/
+        // response stream has lost sync — a late reply would be read as the *next*
+        // command's. Both are only fixable by reconnecting, which recvTask does
+        // once recvResponse has taken the socket down.
+        if (!recvResponse(tcp, buf, kRecvBufSize, "doTcpCmd", cmd))
         {
-            bool ok = tcp->tcpRecv(recv_ptr, static_cast<uint32_t>(kRecvBufSize - (recv_ptr - buf)), has_read, 100);
-            if (!ok)
-            {
-                if (std::chrono::steady_clock::now() > deadline)
-                {
-                    // Either the link is half-open (controller restarted) or the
-                    // command/response stream has lost sync — a late reply would be
-                    // read as the *next* command's. Both are only fixable by
-                    // reconnecting, which recvTask does once the socket is down.
-                    RCLCPP_ERROR(kLogger, "doTcpCmd: response timeout for: %s — dropping dashboard link", cmd);
-                    tcp->disConnect();
-                    err_id = -1;
-                    return;
-                }
-                continue;
-            }
-            if (*(recv_ptr + has_read - 1) == ';')
-                break;
-
-            recv_ptr += has_read;
+            err_id = -1;
+            return;
         }
 
         const char* p = std::strchr(buf, '{');
@@ -250,7 +298,6 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
     err_id = 0;
     try
     {
-        uint32_t has_read;
         char buf[kRecvBufSize];
         memset(buf, 0, sizeof(buf));
         auto currentTime = std::chrono::system_clock::now();
@@ -258,26 +305,10 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
         auto valueMS = currentTime_ms.time_since_epoch().count();
         RCLCPP_INFO(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
         tcp->tcpSend(cmd, strlen(cmd));
-        char *recv_ptr = buf;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (true)
+        if (!recvResponse(tcp, buf, kRecvBufSize, "doTcpCmd_f", cmd))
         {
-            bool ok = tcp->tcpRecv(recv_ptr, static_cast<uint32_t>(kRecvBufSize - (recv_ptr - buf)), has_read, 100);
-            if (!ok)
-            {
-                if (std::chrono::steady_clock::now() > deadline)
-                {
-                    RCLCPP_ERROR(kLogger, "doTcpCmd_f: response timeout for: %s — dropping dashboard link", cmd);
-                    tcp->disConnect();
-                    err_id = -1;
-                    return;
-                }
-                continue;
-            }
-            if (*(recv_ptr + has_read - 1) == ';')
-                break;
-
-            recv_ptr += has_read;
+            err_id = -1;
+            return;
         }
 
         const char* brace_start = std::strchr(buf, '{');
@@ -363,34 +394,16 @@ bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id)
     std::lock_guard<std::mutex> lock(dash_mutex_);
     try
     {
-        uint32_t has_read;
         char buf[kRecvBufSize];
         memset(buf, 0, sizeof(buf));
 
         dash_board_tcp_->tcpSend(cmd.c_str(), cmd.length());
 
-        // Read response until ';' terminator (timeout after 2s).
-        char *recv_ptr = buf;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        while (true)
+        // Read response until ';' terminator (bounded by kResponseTimeout).
+        if (!recvResponse(dash_board_tcp_, buf, kRecvBufSize, "sendServoCommand", cmd.c_str()))
         {
-            bool ok = dash_board_tcp_->tcpRecv(
-                recv_ptr, static_cast<uint32_t>(kRecvBufSize - (recv_ptr - buf)),
-                has_read, 100);
-            if (!ok)
-            {
-                if (std::chrono::steady_clock::now() > deadline)
-                {
-                    RCLCPP_ERROR(kLogger, "sendServoCommand: response timeout — dropping dashboard link");
-                    dash_board_tcp_->disConnect();
-                    err_id = -1;
-                    return false;
-                }
-                continue;
-            }
-            if (*(recv_ptr + has_read - 1) == ';')
-                break;
-            recv_ptr += has_read;
+            err_id = -1;
+            return false;
         }
 
         // Parse error ID (number before first '{').
