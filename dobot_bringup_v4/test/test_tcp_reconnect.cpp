@@ -207,6 +207,102 @@ TEST(CommanderReconnect, SilentRealtimeLinkIsDroppedAndReconnected)
         ::close(dash);
 }
 
+// The field failure this guards: the realtime stream desynchronises (a
+// mid-packet stall used to make tcpRecvExact discard the bytes it had already
+// consumed), after which every read succeeds but lands mid-packet. The old code
+// published that garbage — robot_mode read 0, q_actual read zeros, and the FJT
+// executor refused every trajectory until the node was restarted by hand.
+// recvTask must instead notice the framing markers are wrong and drop the link.
+TEST(CommanderReconnect, MisframedRealtimePacketIsRejectedAndLinkDropped)
+{
+    Listener realtime(30004);
+    Listener dashboard(29999);
+    if (!realtime.bound() || !dashboard.bound())
+        GTEST_SKIP() << "ports 30004/29999 busy (a robot or another test run?)";
+
+    CRCommanderRos2 commander("127.0.0.1");
+    commander.init();
+
+    int first = realtime.accept(2000);
+    ASSERT_GE(first, 0) << "commander never opened the realtime link";
+    int dash = dashboard.accept(2000);
+
+    // A well-framed packet first, so we know the good path still stores data.
+    RealTimeData good{};
+    good.len = sizeof(RealTimeData);
+    good.test_value = 0x0123456789ABCDEFULL;
+    good.robot_mode = 5;
+    ASSERT_EQ(::write(first, &good, sizeof(good)), (ssize_t)sizeof(good));
+
+    for (int i = 0; i < 200 && commander.getRealData().robot_mode != 5; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_EQ(commander.getRealData().robot_mode, 5u) << "valid packet was not stored";
+    EXPECT_GE(commander.realtimeAgeMs(), 0) << "valid packet did not stamp the clock";
+
+    // Now a packet-sized block that is NOT on a packet boundary: correct size,
+    // wrong markers. It must be rejected, and the link dropped so the reconnect
+    // resynchronises — observed as a second connection on the realtime port.
+    RealTimeData bad{};
+    bad.len = 0;
+    bad.test_value = 0xDEADBEEFDEADBEEFULL;
+    bad.robot_mode = 0;
+    ASSERT_EQ(::write(first, &bad, sizeof(bad)), (ssize_t)sizeof(bad));
+
+    int second = realtime.accept(8000);
+    EXPECT_GE(second, 0) << "commander kept a desynchronised link open";
+    EXPECT_EQ(commander.getRealData().robot_mode, 5u)
+        << "out-of-frame packet overwrote the last good one";
+
+    if (second >= 0)
+        ::close(second);
+    ::close(first);
+    if (dash >= 0)
+        ::close(dash);
+}
+
+// A mid-packet stall must be reported as a hard framing failure, not as a
+// benign timeout: the bytes already consumed are gone, so the caller has to
+// drop the link rather than resume reading in the middle of a packet.
+TEST(TcpRecvExact, MidPacketTimeoutThrowsInsteadOfDiscardingBytes)
+{
+    Listener server;
+    ASSERT_TRUE(server.bound());
+
+    TcpClient client("127.0.0.1", server.port());
+    ASSERT_NO_THROW(client.connect());
+    int peer = server.accept(1000);
+    ASSERT_GE(peer, 0);
+
+    // Half a "packet", then silence.
+    uint8_t half[64] = {};
+    ASSERT_EQ(::write(peer, half, sizeof(half)), (ssize_t)sizeof(half));
+
+    uint8_t buf[128];
+    EXPECT_THROW(client.tcpRecvExact(buf, sizeof(buf), 200), TcpClientException);
+    EXPECT_FALSE(client.isConnect());
+
+    ::close(peer);
+}
+
+// An idle link with nothing consumed is still a plain timeout — the caller
+// counts those and only gives up after several in a row.
+TEST(TcpRecvExact, IdleLinkReturnsFalseAndStaysConnected)
+{
+    Listener server;
+    ASSERT_TRUE(server.bound());
+
+    TcpClient client("127.0.0.1", server.port());
+    ASSERT_NO_THROW(client.connect());
+    int peer = server.accept(1000);
+    ASSERT_GE(peer, 0);
+
+    uint8_t buf[128];
+    EXPECT_FALSE(client.tcpRecvExact(buf, sizeof(buf), 200));
+    EXPECT_TRUE(client.isConnect());
+
+    ::close(peer);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------

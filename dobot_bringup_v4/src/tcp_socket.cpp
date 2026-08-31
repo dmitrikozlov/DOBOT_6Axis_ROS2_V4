@@ -160,7 +160,20 @@ bool TcpClient::tcpRecvExact(void *buf, uint32_t len, uint32_t timeout)
         }
         else if (select_result == 0)
         {
-            return false;
+            // Nothing consumed yet: a clean idle. The caller counts these and
+            // decides when the link is dead.
+            if (remaining == len)
+                return false;
+            // Part way through a packet is a different animal. Returning here
+            // would discard the bytes already read and leave the NEXT call
+            // starting mid-packet — the stream stays desynchronised forever,
+            // and because every later read then succeeds, the caller's timeout
+            // counter never trips and the link is never dropped. Kill it here
+            // so the reconnect restarts on a packet boundary.
+            disConnect();
+            throw TcpClientException(toString() + std::string(" partial packet: ") +
+                                     std::to_string(len - remaining) + " of " +
+                                     std::to_string(len) + " bytes before timeout");
         }
 
         ssize_t bytes_read = ::read(fd_, ptr, remaining);

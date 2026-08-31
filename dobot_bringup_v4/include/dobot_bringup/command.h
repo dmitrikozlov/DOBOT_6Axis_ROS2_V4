@@ -16,6 +16,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <chrono>
 #include <algorithm>
 #include <regex>
 #include <assert.h>
@@ -127,6 +128,7 @@ protected:
 private:
     mutable std::mutex mutex_;
     std::shared_ptr<RealTimeData> real_time_data_;
+    std::chrono::steady_clock::time_point real_time_stamp_{};
     std::atomic<bool> is_running_;
     std::unique_ptr<std::thread> thread_;
     std::shared_ptr<TcpClient> real_time_tcp_;
@@ -147,6 +149,12 @@ public:
     bool isConnected() const;
     uint64_t getRobotMode() const;
     RealTimeData getRealData() const;
+
+    // Milliseconds since the last VALID realtime packet, or -1 if none has ever
+    // arrived. Anything reading getRealData() must check this: the struct keeps
+    // its last contents across a link drop, so a feed that has stopped updating
+    // is indistinguishable from a robot that is merely sitting still.
+    int64_t realtimeAgeMs() const;
 
     // Thread-safe, low-overhead command send for servo streaming.
     // Uses dash_mutex_ to serialise with callRosService calls.

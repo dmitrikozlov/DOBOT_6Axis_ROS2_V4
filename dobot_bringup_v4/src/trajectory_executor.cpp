@@ -4,6 +4,10 @@
 #include <cstdio>
 
 static const rclcpp::Logger kLogger = rclcpp::get_logger("trajectory_executor");
+// The controller pushes a realtime packet every ~8 ms. Half a second is 60
+// missed packets — comfortably past any jitter, and short of the ~3 s a
+// reconnect takes, so a genuine blip still gets the full 10 s wait below.
+static constexpr int64_t kRealtimeStaleMs = 500;
 
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
@@ -168,31 +172,48 @@ void TrajectoryExecutor::servoLoop()
     auto wait_start = std::chrono::steady_clock::now();
     while (running_)
     {
-        RealTimeData rd = commander_->getRealData();
-        uint64_t mode = rd.robot_mode;
-        if (mode == 5)
-            break;
-        if (mode == 9 || mode == 11)
+        // robot_mode comes off the realtime feed (TCP 30004), not the
+        // dashboard. When that feed stalls the struct keeps whatever it last
+        // held, so "the robot will not enable" and "we have no idea what the
+        // robot is doing" arrive here looking identical — and the operator
+        // chasing the resulting "current: 0" goes and stares at the arm
+        // instead of the link. Tell them apart.
+        int64_t age_ms = commander_->realtimeAgeMs();
+        bool stale = age_ms < 0 || age_ms > kRealtimeStaleMs;
+
+        uint64_t mode = 0;
+        if (!stale)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.error_msg =
-                "Robot in error mode " + std::to_string(mode) +
-                " before trajectory start";
-            state_.done = true;
-            RCLCPP_ERROR(kLogger, "Robot mode %lu before start — aborting",
-                         static_cast<unsigned long>(mode));
-            running_ = false;
-            return;
+            RealTimeData rd = commander_->getRealData();
+            mode = rd.robot_mode;
+            if (mode == 5)
+                break;
+            if (mode == 9 || mode == 11)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_.error_msg =
+                    "Robot in error mode " + std::to_string(mode) +
+                    " before trajectory start";
+                state_.done = true;
+                RCLCPP_ERROR(kLogger, "Robot mode %lu before start — aborting",
+                             static_cast<unsigned long>(mode));
+                running_ = false;
+                return;
+            }
         }
         if (std::chrono::steady_clock::now() - wait_start >
             std::chrono::seconds(10))
         {
             std::lock_guard<std::mutex> lock(mutex_);
             state_.error_msg =
-                "Timeout waiting for ENABLE mode (current: " +
-                std::to_string(mode) + ")";
+                stale ? "Realtime feedback stale (" +
+                            (age_ms < 0 ? std::string("no packet ever received")
+                                        : std::to_string(age_ms) + " ms since the last one") +
+                            ") — robot mode unknown; check the TCP 30004 link"
+                      : "Timeout waiting for ENABLE mode (current: " +
+                            std::to_string(mode) + ")";
             state_.done = true;
-            RCLCPP_ERROR(kLogger, "Timeout waiting for robot ENABLE mode");
+            RCLCPP_ERROR(kLogger, "%s", state_.error_msg.c_str());
             running_ = false;
             return;
         }

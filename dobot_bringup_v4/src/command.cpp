@@ -9,6 +9,10 @@ static constexpr uint32_t kRecvBufSize = 1024;
 // already abnormal and three consecutive misses mean the link is gone.
 static constexpr uint32_t kRealtimeRecvTimeoutMs = 1000;
 static constexpr int kRealtimeMaxTimeouts = 3;
+// The controller stamps every realtime packet with its own length and a fixed
+// test pattern (see RealTimeData in command.h). Both are framing markers: if
+// either is wrong, the read did not start on a packet boundary.
+static constexpr uint64_t kRealtimeTestValue = 0x0123456789ABCDEFULL;
 
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : is_running_(false)
@@ -57,21 +61,44 @@ void CRCommanderRos2::recvTask()
                 if (real_time_tcp_->tcpRecvExact(&packet, sizeof(RealTimeData), kRealtimeRecvTimeoutMs))
                 {
                     realtime_timeouts = 0;
+
+                    // Reject out-of-frame packets rather than publishing them.
+                    // A desynchronised stream reads as plausible-looking
+                    // garbage: robot_mode lands on some unimplemented field and
+                    // comes out 0, q_actual comes out zeros, and everything
+                    // downstream believes it. The FJT executor gates on
+                    // robot_mode, so it then sits out its whole ENABLE timeout
+                    // and the arm refuses to move until the node is restarted.
+                    // Dropping the link makes that self-healing: the reconnect
+                    // below starts reading on a packet boundary again.
+                    if (packet.len != sizeof(RealTimeData) ||
+                        packet.test_value != kRealtimeTestValue)
+                    {
+                        if (realtime_healthy)
+                        {
+                            RCLCPP_ERROR(kLogger,
+                                "realtime packet out of frame (len=%u, expected %zu; "
+                                "test_value=0x%016llx, expected 0x%016llx) — dropping "
+                                "link to resynchronise; suppressing until recovery",
+                                packet.len, sizeof(RealTimeData),
+                                static_cast<unsigned long long>(packet.test_value),
+                                static_cast<unsigned long long>(kRealtimeTestValue));
+                            realtime_healthy = false;
+                        }
+                        real_time_tcp_->disConnect();
+                        continue;
+                    }
+
                     if (!realtime_healthy)
                     {
                         RCLCPP_INFO(kLogger, "tcp recv recovered");
                         realtime_healthy = true;
                     }
-                    if (packet.len != sizeof(RealTimeData))
-                    {
-                        RCLCPP_WARN_ONCE(kLogger,
-                            "Unexpected packet size: %u (expected %zu)",
-                            packet.len, sizeof(RealTimeData));
-                    }
 
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         *real_time_data_ = packet;
+                        real_time_stamp_ = std::chrono::steady_clock::now();
                     }
                 }
                 else if (++realtime_timeouts >= kRealtimeMaxTimeouts)
@@ -466,4 +493,14 @@ RealTimeData CRCommanderRos2::getRealData() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return *real_time_data_;
+}
+
+int64_t CRCommanderRos2::realtimeAgeMs() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (real_time_stamp_.time_since_epoch().count() == 0)
+        return -1;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - real_time_stamp_)
+        .count();
 }
