@@ -11,6 +11,8 @@
 #include <dobot_bringup/command.h>
 #include <dobot_bringup/tcp_socket.h>
 #include <dirent.h>
+#include <atomic>
+#include <thread>
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -256,6 +258,53 @@ TEST(CommanderReconnect, MisframedRealtimePacketIsRejectedAndLinkDropped)
     if (second >= 0)
         ::close(second);
     ::close(first);
+    if (dash >= 0)
+        ::close(dash);
+}
+
+// A permanently misframed realtime stream must not become a reconnect storm.
+//
+// The out-of-frame branch drops the link and the loop immediately reconnects.
+// The controller pushes a packet every ~8 ms, so with nothing to rate-limit it
+// that is ~100 TCP connects/sec against port 30004 — and it is SILENT, because
+// the error is edge-triggered on `realtime_healthy`, which never resets without
+// a good packet. The only visible symptom is CPU.
+TEST(CommanderReconnect, MisframedRealtimeBacksOffInsteadOfStorming)
+{
+    Listener realtime(30004);
+    Listener dashboard(29999);
+    if (!realtime.bound() || !dashboard.bound())
+        GTEST_SKIP() << "ports 30004/29999 busy (a robot or another test run?)";
+
+    CRCommanderRos2 commander("127.0.0.1");
+    commander.init();
+
+    int dash = dashboard.accept(2000);
+
+    RealTimeData bad{};
+    bad.len = 0;
+    bad.test_value = 0xDEADBEEFDEADBEEFULL;
+
+    // Meet every reconnect with another out-of-frame packet for a fixed window,
+    // and count how many times the commander comes back.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    int reconnects = 0;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        int sock = realtime.accept(200);
+        if (sock < 0)
+            continue;
+        ++reconnects;
+        (void)::write(sock, &bad, sizeof(bad));
+        ::close(sock);
+    }
+
+    // One per backoff period over a 3 s window, plus the initial connect and
+    // scheduling slop. Without the backoff this runs into the hundreds.
+    EXPECT_LE(reconnects, 6)
+        << "realtime link reconnected " << reconnects << " times in 3 s — a "
+           "misframed stream is storming the controller instead of backing off";
+
     if (dash >= 0)
         ::close(dash);
 }

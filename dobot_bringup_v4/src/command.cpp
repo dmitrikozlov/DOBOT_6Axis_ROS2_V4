@@ -51,8 +51,14 @@ void CRCommanderRos2::recvTask()
     bool realtime_healthy = true;
     bool dashboard_healthy = true;
     int realtime_timeouts = 0;
+    // Set when the realtime link was dropped for a reason that does NOT
+    // rate-limit itself — misframing, or a socket error — as opposed to the
+    // 3-strike timeout path, which has already spent 3 s of recv timeouts by
+    // the time it drops. Consumed by the backoff at the bottom of the loop.
+    bool realtime_backoff = false;
     while (is_running_)
     {
+        realtime_backoff = false;
         if (real_time_tcp_->isConnect())
         {
             try
@@ -71,6 +77,15 @@ void CRCommanderRos2::recvTask()
                     // and the arm refuses to move until the node is restarted.
                     // Dropping the link makes that self-healing: the reconnect
                     // below starts reading on a packet boundary again.
+                    //
+                    // No `continue` here, so the loop bottom is always reached:
+                    // that is where the backoff lives, and it must not be
+                    // skippable by the very branch that needs it. (The `continue`
+                    // this replaces also skipped the dashboard's reconnect block,
+                    // though only for the one iteration that read the bad packet —
+                    // the next iteration finds the link down, takes the connect
+                    // branch, and reaches the dashboard normally. A wart, not the
+                    // outage it looks like.)
                     if (packet.len != sizeof(RealTimeData) ||
                         packet.test_value != kRealtimeTestValue)
                     {
@@ -86,16 +101,16 @@ void CRCommanderRos2::recvTask()
                             realtime_healthy = false;
                         }
                         real_time_tcp_->disConnect();
-                        continue;
+                        realtime_backoff = true;
                     }
-
-                    if (!realtime_healthy)
+                    else
                     {
-                        RCLCPP_INFO(kLogger, "tcp recv recovered");
-                        realtime_healthy = true;
-                    }
+                        if (!realtime_healthy)
+                        {
+                            RCLCPP_INFO(kLogger, "tcp recv recovered");
+                            realtime_healthy = true;
+                        }
 
-                    {
                         std::lock_guard<std::mutex> lock(mutex_);
                         *real_time_data_ = packet;
                         real_time_stamp_ = std::chrono::steady_clock::now();
@@ -124,6 +139,7 @@ void CRCommanderRos2::recvTask()
             {
                 real_time_tcp_->disConnect();
                 realtime_timeouts = 0;
+                realtime_backoff = true;
                 if (realtime_healthy)
                 {
                     RCLCPP_ERROR(kLogger, "tcp recv error: %s", err.what());
@@ -181,6 +197,23 @@ void CRCommanderRos2::recvTask()
             }
             if (connect_failed)
                 sleep(3);  // outside the lock: don't stall service calls on a doomed link
+        }
+
+        // Back off after a drop that would otherwise re-loop at full speed. The
+        // controller pushes a packet every ~8 ms, so a stream that misframes
+        // every packet — or a socket that throws on every read — would turn this
+        // loop into ~100 connects/sec against port 30004, silently: the errors
+        // above are edge-triggered and `realtime_healthy` never resets without a
+        // good packet, so the only visible symptom is CPU.
+        //
+        // AFTER the dashboard block, not inside the realtime branch, so a
+        // misframed realtime link never delays the dashboard's own reconnect —
+        // that coupling is the defect this pairs with. One second: short enough
+        // that a genuine one-off resync costs nothing anyone notices, long
+        // enough that a permanent fault costs one connect per second.
+        if (realtime_backoff)
+        {
+            sleep(1);
         }
     }
 }
