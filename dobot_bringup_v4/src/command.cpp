@@ -310,7 +310,7 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
         auto currentTime = std::chrono::system_clock::now();
         auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
         auto valueMS = currentTime_ms.time_since_epoch().count();
-        RCLCPP_INFO(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
+        RCLCPP_DEBUG(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
 
         tcp->tcpSend(cmd, strlen(cmd));
         // Either the link is half-open (controller restarted) or the command/
@@ -330,10 +330,13 @@ void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd,
             while (!num_str.empty() && (num_str.back() == ',' || num_str.back() == ' '))
                 num_str.pop_back();
             err_id = stringToInt(num_str);
-            RCLCPP_INFO(kLogger, "ErrorID: %s", num_str.c_str());
+            if (err_id != 0)
+                RCLCPP_WARN(kLogger, "ErrorID: %s for: %s", num_str.c_str(), cmd);
+            else
+                RCLCPP_DEBUG(kLogger, "ErrorID: %s", num_str.c_str());
         }
 
-        RCLCPP_INFO(kLogger, "tcp recv feedback: %s", buf); // FIXME parse the buf may be better
+        RCLCPP_DEBUG(kLogger, "tcp recv feedback: %s", buf); // FIXME parse the buf may be better
     }
     catch (const std::logic_error &err)
     {
@@ -363,7 +366,8 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
         auto currentTime = std::chrono::system_clock::now();
         auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
         auto valueMS = currentTime_ms.time_since_epoch().count();
-        RCLCPP_INFO(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
+        // Same reasoning as doTcpCmd above.
+        RCLCPP_DEBUG(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
         tcp->tcpSend(cmd, strlen(cmd));
         if (!recvResponse(tcp, buf, kRecvBufSize, "doTcpCmd_f", cmd))
         {
@@ -383,7 +387,10 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
             }
 
             err_id = stringToInt(num_str);
-            RCLCPP_INFO(kLogger, "ErrorID: %d", err_id);
+            if (err_id != 0)
+                RCLCPP_WARN(kLogger, "ErrorID: %d for: %s", err_id, cmd);
+            else
+                RCLCPP_DEBUG(kLogger, "ErrorID: %d", err_id);
 
             const char* brace_end = std::strchr(brace_start, '}');
 
@@ -391,7 +398,7 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
                 mode_id = std::string(brace_start, brace_end - brace_start + 1);
         }
 
-        RCLCPP_INFO(kLogger, "tcp recv feedback: %s", buf); // FIXME parse the buf may be better
+        RCLCPP_DEBUG(kLogger, "tcp recv feedback: %s", buf); // FIXME parse the buf may be better
     }
     catch (const std::logic_error &err)
     {
