@@ -366,7 +366,6 @@ void CRCommanderRos2::doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cm
         auto currentTime = std::chrono::system_clock::now();
         auto currentTime_ms = std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime);
         auto valueMS = currentTime_ms.time_since_epoch().count();
-        // Same reasoning as doTcpCmd above.
         RCLCPP_DEBUG(kLogger, "time: %ld  tcp send cmd: %s", valueMS, cmd);
         tcp->tcpSend(cmd, strlen(cmd));
         if (!recvResponse(tcp, buf, kRecvBufSize, "doTcpCmd_f", cmd))
