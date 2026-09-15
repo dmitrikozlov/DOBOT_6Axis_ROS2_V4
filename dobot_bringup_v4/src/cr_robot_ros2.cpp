@@ -326,8 +326,10 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
 void CRRobotRos2::pubFeedBackInfo()
 {
-    // 设置发布频率为100Hz
-    rclcpp::Rate rate(100);
+    // 10 Hz: the JSON is rebuilt and dumped every cycle whether or not anyone is
+    // listening, and the one consumer (the orchestrator's health read) wants a
+    // fresh mode, not a fast one.
+    rclcpp::Rate rate(10);
 
     while (rclcpp::ok())
     {
@@ -338,6 +340,10 @@ void CRRobotRos2::pubFeedBackInfo()
         root["digital_input_bits"] = realTimeData.digital_input_bits;
         root["digital_outputs"] = realTimeData.digital_outputs;
         root["robot_mode"] = realTimeData.robot_mode;
+        // The struct keeps its last contents across a link drop, so robot_mode
+        // alone cannot tell a stopped feed from a robot sitting still.
+        root["realtime_age_ms"] = commander_->realtimeAgeMs();
+        root["dashboard_mute"] = commander_->dashboardMute();
         root["controller_timer"] = realTimeData.controller_timer;
         root["run_time"] = realTimeData.run_time;
         root["test_value"] = realTimeData.test_value;

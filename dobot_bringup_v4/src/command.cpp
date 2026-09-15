@@ -240,6 +240,36 @@ namespace
 // each individual recv blocks while waiting.
 constexpr auto kResponseTimeout = std::chrono::seconds(2);
 constexpr uint32_t kResponsePollMs = 100;
+}  // namespace
+
+/// One line when the dashboard stops answering, and nothing more until it does:
+/// every command that follows drops the link and reconnects, so the untamed form
+/// of this is the same three lines every few seconds and no summary.
+void CRCommanderRos2::noteDashboardMute(const char *fn, const char *cmd, const char *why)
+{
+    if (!dash_mute_.exchange(true))
+    {
+        dash_mute_since_ = std::chrono::steady_clock::now();
+        dash_mute_failures_ = 0;
+        RCLCPP_WARN(kLogger, "%s: dashboard connected but not answering (%s) for: %s — dropping "
+                    "the link; suppressing until it replies", fn, why, cmd);
+    }
+    ++dash_mute_failures_;
+}
+
+/// The recovery half, carrying the reply verbatim: the robot's state can change
+/// without us during a mute window (an operator on the pendant), and the first
+/// reply back is the only place that shows it.
+void CRCommanderRos2::noteDashboardReply(const char *reply)
+{
+    if (!dash_mute_.exchange(false))
+        return;
+
+    const double mute_s = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - dash_mute_since_).count();
+    RCLCPP_INFO(kLogger, "dashboard answering again after %.1f s and %u unanswered command(s); "
+                "first reply: %s", mute_s, dash_mute_failures_, reply);
+}
 
 /// Read one ';'-terminated dashboard response into `buf`, which is left NUL
 /// terminated. Returns false — after dropping the link — when no complete
@@ -255,8 +285,8 @@ constexpr uint32_t kResponsePollMs = 100;
 /// `while (len)` loop never runs), so a deadline confined to the !ok branch spins
 /// forever — while holding dash_mutex_. The node stays alive, keeps its topics,
 /// and silently stops answering every service call.
-bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
-                  const char *fn, const char *cmd)
+bool CRCommanderRos2::recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
+                                   const char *fn, const char *cmd)
 {
     char *recv_ptr = buf;
     const auto deadline = std::chrono::steady_clock::now() + kResponseTimeout;
@@ -265,7 +295,7 @@ bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
     {
         if (std::chrono::steady_clock::now() > deadline)
         {
-            RCLCPP_ERROR(kLogger, "%s: response timeout for: %s — dropping dashboard link", fn, cmd);
+            noteDashboardMute(fn, cmd, "no reply");
             tcp->disConnect();
             return false;
         }
@@ -274,8 +304,7 @@ bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
         const uint32_t space = buf_size - 1 - static_cast<uint32_t>(recv_ptr - buf);
         if (space == 0)
         {
-            RCLCPP_ERROR(kLogger, "%s: response exceeded %u bytes with no ';' for: %s — dropping dashboard link",
-                         fn, buf_size - 1, cmd);
+            noteDashboardMute(fn, cmd, "reply overran the buffer with no ';'");
             tcp->disConnect();
             return false;
         }
@@ -294,10 +323,12 @@ bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
 
         recv_ptr += has_read;
         if (*(recv_ptr - 1) == ';')
+        {
+            noteDashboardReply(buf);
             return true;
+        }
     }
 }
-}  // namespace
 void CRCommanderRos2::doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,
                                std::vector<std::string> &result)
 {
@@ -512,7 +543,9 @@ bool CRCommanderRos2::isConnected() const
     static bool last_connected = true;
     bool current_connected = dash_connected && real_time_connected;
     
-    if (!current_connected && last_connected) {
+    // Not while the dashboard is mute: that drop is already reported once, and
+    // the link bounces on every command until it answers.
+    if (!current_connected && last_connected && !dash_mute_) {
         RCLCPP_WARN(rclcpp::get_logger("CRCommanderRos2"), 
                     "Robot disconnected - Dashboard: %s, Real-time: %s", 
                     dash_connected ? "connected" : "disconnected", 
@@ -521,6 +554,11 @@ bool CRCommanderRos2::isConnected() const
     last_connected = current_connected;
     
     return current_connected;
+}
+
+bool CRCommanderRos2::dashboardMute() const
+{
+    return dash_mute_;
 }
 
 uint64_t CRCommanderRos2::getRobotMode() const

@@ -11,6 +11,7 @@
 #ifndef COMMANDER_H
 #define COMMANDER_H
 
+#include <atomic>
 #include <vector>
 #include <string>
 #include <memory>
@@ -147,6 +148,12 @@ public:
     bool callRosService(const std::string cmd, int32_t &err_id, std::vector<std::string> &result_);
     bool isEnable() const;
     bool isConnected() const;
+
+    // True once a dashboard command has gone unanswered, until one is answered
+    // again. The controller accepting the socket but ignoring commands is what a
+    // controller left in Online mode (rather than TCP/IP mode) looks like from
+    // here — the realtime feed keeps streaming either way.
+    bool dashboardMute() const;
     uint64_t getRobotMode() const;
     RealTimeData getRealData() const;
 
@@ -164,10 +171,25 @@ public:
 private:
     std::mutex dash_mutex_;  // guards dashboard TCP access (service calls + servo streaming)
 
-    static void doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,
-                         std::vector<std::string> &result);
-    static void doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,std::string &mode_id,
-                         std::vector<std::string> &result);
+    // Dashboard mute: the socket accepts but the controller stops answering, so
+    // every command drops the link and the next one reconnects and repeats.
+    // Edge-logged like the realtime link — one line down, one line up — with the
+    // first reply after recovery, which is what says whether the robot's state
+    // changed behind our back. Written under dash_mutex_; the flag is atomic
+    // because isConnected() reads it from the publisher thread.
+    std::atomic<bool> dash_mute_{false};
+    uint32_t dash_mute_failures_{0};
+    std::chrono::steady_clock::time_point dash_mute_since_{};
+
+    bool recvResponse(std::shared_ptr<TcpClient> &tcp, char *buf, uint32_t buf_size,
+                      const char *fn, const char *cmd);
+    void noteDashboardMute(const char *fn, const char *cmd, const char *why);
+    void noteDashboardReply(const char *reply);
+
+    void doTcpCmd(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id,
+                  std::vector<std::string> &result);
+    void doTcpCmd_f(std::shared_ptr<TcpClient> &tcp, const char *cmd, int32_t &err_id, std::string &mode_id,
+                    std::vector<std::string> &result);
     static inline double rad2Deg(double rad)
     {
         return rad * 180.0 / PI;
