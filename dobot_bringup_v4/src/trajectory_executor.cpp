@@ -1,13 +1,64 @@
 #include <dobot_bringup/trajectory_executor.h>
 #include <rclcpp/rclcpp.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <deque>
+#include <string>
 
 static const rclcpp::Logger kLogger = rclcpp::get_logger("trajectory_executor");
 // The controller pushes a realtime packet every ~8 ms. Half a second is 60
 // missed packets — comfortably past any jitter, and short of the ~3 s a
 // reconnect takes, so a genuine blip still gets the full 10 s wait below.
 static constexpr int64_t kRealtimeStaleMs = 500;
+
+namespace
+{
+// One sent ServoJ, kept so a controller rejection can be traced to the
+// commands just before it.
+struct SentServo
+{
+    double elapsed;                 // trajectory time of the target (s)
+    double gap_ms;                  // wall time since the previous send
+    std::array<double, 6> target;   // deg
+    std::array<double, 6> actual;   // deg, controller feedback at send time
+};
+
+constexpr size_t kRecentSends = 8;
+
+std::string joints(const std::array<double, 6> &v, const char *fmt = "%.3f")
+{
+    std::string out = "[";
+    char buf[32];
+    for (size_t j = 0; j < 6; j++)
+    {
+        std::snprintf(buf, sizeof(buf), fmt, v[j]);
+        out += buf;
+        if (j < 5)
+            out += ", ";
+    }
+    return out + "]";
+}
+
+// The commands before a failure: target, actual, and the joint speed the
+// controller derives from consecutive targets (step / t).
+void logRecentSends(const std::deque<SentServo> &sends, double servo_t)
+{
+    RCLCPP_ERROR(kLogger, "Last %zu ServoJ commands (deg; speed = step / t=%.3f s):",
+                 sends.size(), servo_t);
+    for (size_t i = 0; i < sends.size(); i++)
+    {
+        const SentServo &s = sends[i];
+        std::array<double, 6> speed{};
+        if (i > 0)
+            for (size_t j = 0; j < 6; j++)
+                speed[j] = (s.target[j] - sends[i - 1].target[j]) / servo_t;
+        RCLCPP_ERROR(kLogger, "  t=%.3f gap=%.1f ms target=%s actual=%s speed=%s deg/s",
+                     s.elapsed, s.gap_ms, joints(s.target).c_str(),
+                     joints(s.actual).c_str(), joints(speed, "%.1f").c_str());
+    }
+}
+}  // namespace
 
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
@@ -232,6 +283,9 @@ void TrajectoryExecutor::servoLoop()
     }
 
     uint64_t iteration = 0;
+    std::deque<SentServo> recent;
+    auto last_send = start_time;
+    double max_gap_ms = 0.0;
 
     while (running_)
     {
@@ -264,7 +318,9 @@ void TrajectoryExecutor::servoLoop()
             state_.elapsed = total_duration;
             state_.desired = final_target;
             state_.done = true;
-            RCLCPP_INFO(kLogger, "Trajectory complete: %.2f s", elapsed);
+            RCLCPP_INFO(kLogger, "Trajectory complete: %.2f s, longest gap between "
+                        "ServoJ commands %.1f ms (nominal %.1f ms)",
+                        elapsed, max_gap_ms, 1000.0 / servo_rate_);
             break;
         }
 
@@ -287,6 +343,7 @@ void TrajectoryExecutor::servoLoop()
             RCLCPP_ERROR(kLogger,
                          "Robot mode %lu — aborting trajectory",
                          static_cast<unsigned long>(mode));
+            logRecentSends(recent, servo_t_);
             break;
         }
 
@@ -300,7 +357,20 @@ void TrajectoryExecutor::servoLoop()
                       servo_t_, aheadtime_, gain_);
 
         int32_t err_id = 0;
+        auto send_time = std::chrono::steady_clock::now();
         bool ok = commander_->sendServoCommand(std::string(cmd), err_id);
+
+        SentServo sent{elapsed,
+                       std::chrono::duration<double, std::milli>(send_time - last_send).count(),
+                       target, {}};
+        for (size_t j = 0; j < 6; j++)
+            sent.actual[j] = real_data.q_actual[j];
+        if (iteration > 0)
+            max_gap_ms = std::max(max_gap_ms, sent.gap_ms);
+        last_send = send_time;
+        recent.push_back(sent);
+        if (recent.size() > kRecentSends)
+            recent.pop_front();
 
         if (!ok || err_id != 0)
         {
@@ -309,6 +379,7 @@ void TrajectoryExecutor::servoLoop()
                 "ServoJ failed: err_id=" + std::to_string(err_id);
             state_.done = true;
             RCLCPP_ERROR(kLogger, "ServoJ failed: err_id=%d", err_id);
+            logRecentSends(recent, servo_t_);
             break;
         }
 
