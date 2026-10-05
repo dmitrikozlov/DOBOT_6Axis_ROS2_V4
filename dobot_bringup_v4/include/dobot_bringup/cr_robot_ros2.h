@@ -157,7 +157,7 @@ public:
                                std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response);
     void goalHandle();
     void backendTask();
-    void getJointState(double *point);
+    bool getJointState(double *point);
     bool isEnable() const;
     bool isConnected() const;
     void getToolVectorActual(double *val);

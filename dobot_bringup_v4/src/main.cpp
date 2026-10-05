@@ -48,19 +48,17 @@ int main(int argc, char *argv[])
   double position[6];
   while (rclcpp::ok())
   {
-    // 获取关节状态并发布消息
-    if (robot->isConnected()) {
-      robot->getJointState(position);
-    } else {
-      memset(position, 0, sizeof(position));
+    // Joint states only from fresh realtime data: without it nothing is
+    // published, so TF and MoveIt keep no pose rather than a made-up one.
+    if (robot->getJointState(position)) {
+      joint_state_msg.header.stamp = robot->get_clock()->now();
+      joint_state_msg.header.frame_id = "dummy_link";
+      for (uint32_t i = 0; i < 6; i++)
+      {
+        joint_state_msg.position[i] = position[i];
+      }
+      joint_state_pub->publish(joint_state_msg);
     }
-    joint_state_msg.header.stamp = robot->get_clock()->now();
-    joint_state_msg.header.frame_id = "dummy_link";
-    for (uint32_t i = 0; i < 6; i++)
-    {
-      joint_state_msg.position[i] = position[i];
-    }
-    joint_state_pub->publish(joint_state_msg);
 
     double val[6];
     if (robot->isConnected()) {

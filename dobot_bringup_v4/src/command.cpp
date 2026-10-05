@@ -13,6 +13,9 @@ static constexpr int kRealtimeMaxTimeouts = 3;
 // test pattern (see RealTimeData in command.h). Both are framing markers: if
 // either is wrong, the read did not start on a packet boundary.
 static constexpr uint64_t kRealtimeTestValue = 0x0123456789ABCDEFULL;
+// Joint angles older than this are not reported: the realtime link sends a
+// packet every few milliseconds, so a gap this long means it is down or stalled.
+static constexpr std::chrono::milliseconds kJointStateMaxAge{500};
 
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : is_running_(false)
@@ -29,11 +32,15 @@ CRCommanderRos2::~CRCommanderRos2()
         thread_->join();
 }
 
-void CRCommanderRos2::getCurrentJointStatus(double *joint)
+bool CRCommanderRos2::getCurrentJointStatus(double *joint)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (real_time_stamp_.time_since_epoch().count() == 0 ||
+        std::chrono::steady_clock::now() - real_time_stamp_ > kJointStateMaxAge)
+        return false;
     for (uint32_t i = 0; i < 6; i++)
         joint[i] = deg2Rad(real_time_data_->q_actual[i]);
+    return true;
 }
 
 void CRCommanderRos2::getToolVectorActual(double *val)

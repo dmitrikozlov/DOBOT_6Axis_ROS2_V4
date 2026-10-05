@@ -139,7 +139,10 @@ public:
     explicit CRCommanderRos2(const std::string &ip);
 
     ~CRCommanderRos2();
-    void getCurrentJointStatus(double *joint);
+    // Fills joint and returns true only if a valid realtime packet arrived in
+    // the last kJointStateMaxAge; false if none ever did, or the link is down
+    // or stalled.
+    bool getCurrentJointStatus(double *joint);
     void getToolVectorActual(double *val);
     void recvTask();
     void init();
