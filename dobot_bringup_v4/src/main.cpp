@@ -61,8 +61,12 @@ int main(int argc, char *argv[])
     }
 
     double val[6];
-    if (robot->isConnected()) {
-      robot->getToolVectorActual(val);
+    int user = 0, tool = 0;
+    if (robot->getToolVectorActual(val, &user, &tool)) {
+      tool_vector_actual_msg.header.stamp = robot->get_clock()->now();
+      tool_vector_actual_msg.header.frame_id = "base_link";
+      tool_vector_actual_msg.user = static_cast<int8_t>(user);
+      tool_vector_actual_msg.tool = static_cast<int8_t>(tool);
       tool_vector_actual_msg.x = val[0];
       tool_vector_actual_msg.y = val[1];
       tool_vector_actual_msg.z = val[2];

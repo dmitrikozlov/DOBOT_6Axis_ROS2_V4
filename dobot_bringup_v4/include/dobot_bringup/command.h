@@ -143,7 +143,9 @@ public:
     // the last kJointStateMaxAge; false if none ever did, or the link is down
     // or stalled.
     bool getCurrentJointStatus(double *joint);
-    void getToolVectorActual(double *val);
+    // Like getCurrentJointStatus: the active tool's pose (mm, deg) and the
+    // active user and tool frames, only from fresh realtime data.
+    bool getToolVectorActual(double *val, int *user, int *tool);
     void recvTask();
     void init();
     bool callRosService(const std::string cmd, int32_t &err_id);

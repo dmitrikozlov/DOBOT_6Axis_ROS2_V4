@@ -43,10 +43,16 @@ bool CRCommanderRos2::getCurrentJointStatus(double *joint)
     return true;
 }
 
-void CRCommanderRos2::getToolVectorActual(double *val)
+bool CRCommanderRos2::getToolVectorActual(double *val, int *user, int *tool)
 {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (real_time_stamp_.time_since_epoch().count() == 0 ||
+        std::chrono::steady_clock::now() - real_time_stamp_ > kJointStateMaxAge)
+        return false;
     memcpy(val, real_time_data_->tool_vector_actual, sizeof(double) * 6);
+    *user = real_time_data_->userCoordinate;
+    *tool = real_time_data_->toolCoordinate;
+    return true;
 }
 
 void CRCommanderRos2::recvTask()

@@ -678,9 +678,9 @@ bool CRRobotRos2::isConnected() const
     return commander_->isConnected();
 }
 
-void CRRobotRos2::getToolVectorActual(double *val)
+bool CRRobotRos2::getToolVectorActual(double *val, int *user, int *tool)
 {
-    commander_->getToolVectorActual(val);
+    return commander_->getToolVectorActual(val, user, tool);
 }
 
 /*

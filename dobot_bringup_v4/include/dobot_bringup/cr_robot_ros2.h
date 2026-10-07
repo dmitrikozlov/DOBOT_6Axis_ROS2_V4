@@ -160,7 +160,7 @@ public:
     bool getJointState(double *point);
     bool isEnable() const;
     bool isConnected() const;
-    void getToolVectorActual(double *val);
+    bool getToolVectorActual(double *val, int *user, int *tool);
 
 protected:
     /**
