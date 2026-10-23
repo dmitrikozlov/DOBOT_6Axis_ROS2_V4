@@ -15,6 +15,7 @@
 #include <rclcpp/node.hpp>
 #include <rclcpp/executor.hpp>
 #include <nlohmann/json.hpp>
+#include <atomic>
 #include <string>
 #include <memory>
 #include <dobot_bringup/parseTool.h>
@@ -441,6 +442,9 @@ private:
     // Trajectory execution
     std::shared_ptr<TrajectoryExecutor> trajectory_executor_;
     rclcpp_action::Server<FollowJointTrajectory>::SharedPtr fjt_action_server_;
+    std::atomic<bool> fjt_busy_{false};    // a goal is executing; others are refused
+    double goal_tolerance_deg_ = 0.01;     // arrival, for joints the goal leaves at 0
+    double goal_time_tolerance_ = 1.0;     // s after the last point, if the goal gives none
 };
 
 #endif // CRROBOTROS2_H

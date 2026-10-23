@@ -4,7 +4,8 @@
  * Resamples a MoveIt-planned trajectory to a fixed rate and sends ServoJ
  * commands directly over the dashboard TCP, bypassing the ROS service layer
  * for minimal latency.  Robot mode is monitored from the real-time feedback
- * channel; the loop aborts on ERROR (9) or COLLISION (11).
+ * channel; the loop aborts on ERROR (9) or COLLISION (11), or when the feed
+ * stalls.  After the last point it waits for the arm to settle on it.
  */
 
 #ifndef TRAJECTORY_EXECUTOR_H
@@ -24,6 +25,17 @@
 class TrajectoryExecutor
 {
 public:
+    // The driver's joints, in the order ServoJ takes them.
+    static const std::array<std::string, 6> kJointNames;
+
+    // When a trajectory counts as arrived: every joint within its tolerance
+    // of the last point, within time_s of the end of the stream.
+    struct GoalTolerance
+    {
+        std::array<double, 6> position_deg{0.01, 0.01, 0.01, 0.01, 0.01, 0.01};
+        double time_s = 1.0;
+    };
+
     TrajectoryExecutor(std::shared_ptr<CRCommanderRos2> commander,
                        double servo_rate = 50.0,
                        double servo_t = 0.02,
@@ -34,14 +46,28 @@ public:
     ~TrajectoryExecutor();
 
     // Load a new trajectory.  Stops current execution if running.
-    // Joint positions must be in radians (ROS convention); they are
-    // converted to degrees for the Dobot controller internally.
+    // Joint positions must be in radians (ROS convention) and in the order of
+    // kJointNames (see toDriverOrder); they are converted to degrees for the
+    // Dobot controller internally.
+    void loadTrajectory(const trajectory_msgs::msg::JointTrajectory &traj,
+                        const GoalTolerance &tolerance);
     void loadTrajectory(const trajectory_msgs::msg::JointTrajectory &traj);
+
+    // Why joint_names cannot be mapped onto kJointNames, or an empty string;
+    // from[j] is then the index of kJointNames[j] in joint_names.
+    static std::string jointOrder(const std::vector<std::string> &joint_names,
+                                  std::array<size_t, 6> &from);
+
+    // Copy traj into out with its points in kJointNames order. Returns an
+    // empty string, or why the trajectory cannot be executed.
+    static std::string toDriverOrder(const trajectory_msgs::msg::JointTrajectory &traj,
+                                     trajectory_msgs::msg::JointTrajectory &out);
 
     // Start streaming ServoJ commands.
     void start();
 
-    // Stop streaming and send Dobot Stop() to flush the controller queue.
+    // Stop streaming and send Dobot Stop(): the arm halts where it is. After
+    // the last point has been sent, only the wait for arrival is abandoned.
     void stop();
 
     bool isRunning() const;
@@ -55,6 +81,7 @@ public:
         std::array<double, 6> error{};    // desired - actual (degrees)
         bool done = false;
         std::string error_msg;            // non-empty on failure
+        bool goal_tolerance_violated = false;  // streamed, but did not arrive
     };
 
     State getState() const;
@@ -80,18 +107,37 @@ public:
     // How late a send may be and still keep the schedule (s): wake-up jitter.
     static constexpr double kLateSend = 0.001;
 
+    // Arrival: true once every joint's offset from the last point has stayed
+    // within its tolerance for kSettleS of feed time.
+    class ArrivalCheck
+    {
+    public:
+        explicit ArrivalCheck(const std::array<double, 6> &tolerance_deg)
+            : tolerance_(tolerance_deg) {}
+        bool update(double t, const std::array<double, 6> &offset_deg);
+
+    private:
+        std::array<double, 6> tolerance_;
+        double within_since_ = -1.0;
+    };
+    static constexpr double kSettleS = 0.05;
+
 private:
     void servoLoop();
+    void settle(const std::array<double, 6> &final_target);
+    void fail(const std::string &msg);
     std::array<double, 6> interpolate(double t) const;  // caller must hold mutex_
 
     std::shared_ptr<CRCommanderRos2> commander_;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> settling_{false};  // streamed; waiting for the arm to arrive
     mutable std::mutex mutex_;  // guards trajectory data and state_
 
     // Trajectory data — stored in degrees (Dobot convention)
     std::vector<double> timestamps_;
     std::vector<std::array<double, 6>> joints_deg_;
+    GoalTolerance tolerance_;
 
     // Configuration
     double servo_rate_;

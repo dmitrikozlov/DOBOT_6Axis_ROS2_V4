@@ -432,3 +432,84 @@ int main(int argc, char **argv)
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
+
+// --- Goal checks: joint order -----------------------------------------------
+
+TEST(TrajectoryExecutorGoal, JointsReorderedByName)
+{
+    JointTrajectory traj;
+    traj.joint_names = {"joint6", "joint5", "joint4", "joint3", "joint2", "joint1"};
+    traj.points.push_back(makePoint({6, 5, 4, 3, 2, 1}, 0.0));
+    traj.points.push_back(makePoint({60, 50, 40, 30, 20, 10}, 1.0));
+
+    JointTrajectory out;
+    EXPECT_EQ(TrajectoryExecutor::toDriverOrder(traj, out), "");
+    ASSERT_EQ(out.points.size(), 2u);
+    EXPECT_EQ(out.joint_names.front(), "joint1");
+    for (size_t j = 0; j < 6; j++)
+    {
+        EXPECT_DOUBLE_EQ(out.points[0].positions[j], static_cast<double>(j + 1));
+        EXPECT_DOUBLE_EQ(out.points[1].positions[j], 10.0 * static_cast<double>(j + 1));
+    }
+}
+
+TEST(TrajectoryExecutorGoal, UnknownOrMissingJointRefused)
+{
+    std::array<size_t, 6> from{};
+    EXPECT_NE(TrajectoryExecutor::jointOrder(
+                  {"joint1", "joint2", "joint3", "joint4", "joint5", "wrist"}, from)
+                  .find("joint6"),
+              std::string::npos);
+    EXPECT_NE(TrajectoryExecutor::jointOrder({"joint1", "joint2"}, from), "");
+    EXPECT_EQ(TrajectoryExecutor::jointOrder(
+                  {"joint2", "joint1", "joint3", "joint4", "joint5", "joint6"}, from),
+              "");
+    EXPECT_EQ(from[0], 1u);
+    EXPECT_EQ(from[1], 0u);
+}
+
+TEST(TrajectoryExecutorGoal, BadPointsRefused)
+{
+    JointTrajectory out;
+    EXPECT_NE(TrajectoryExecutor::toDriverOrder(makeTrajectory({}), out), "");
+
+    auto backwards = makeTrajectory({{{0, 0, 0, 0, 0, 0}, 1.0}, {{0, 0, 0, 0, 0, 0}, 0.5}});
+    EXPECT_NE(TrajectoryExecutor::toDriverOrder(backwards, out).find("earlier"),
+              std::string::npos);
+
+    auto short_point = makeTrajectory({{{0, 0, 0, 0, 0, 0}, 0.0}});
+    short_point.points[0].positions.pop_back();
+    EXPECT_NE(TrajectoryExecutor::toDriverOrder(short_point, out), "");
+
+    auto nan = makeTrajectory({{{0, 0, std::nan(""), 0, 0, 0}, 0.0}});
+    EXPECT_NE(TrajectoryExecutor::toDriverOrder(nan, out).find("non-finite"),
+              std::string::npos);
+}
+
+// --- Arrival -----------------------------------------------------------------
+
+TEST(TrajectoryExecutorArrival, ArrivesAfterStayingWithinTolerance)
+{
+    TrajectoryExecutor::ArrivalCheck check({0.01, 0.01, 0.01, 0.01, 0.01, 0.01});
+    EXPECT_FALSE(check.update(0.000, {0.05, 0, 0, 0, 0, 0}));
+    EXPECT_FALSE(check.update(0.010, {0.005, 0, 0, 0, 0, 0}));
+    EXPECT_FALSE(check.update(0.040, {-0.008, 0, 0, 0, 0, 0}));
+    EXPECT_TRUE(check.update(0.010 + TrajectoryExecutor::kSettleS, {0.002, 0, 0, 0, 0, 0}));
+}
+
+TEST(TrajectoryExecutorArrival, LeavingToleranceRestartsTheWait)
+{
+    TrajectoryExecutor::ArrivalCheck check({0.01, 0.01, 0.01, 0.01, 0.01, 0.01});
+    EXPECT_FALSE(check.update(0.00, {0, 0, 0, 0, 0, 0}));
+    EXPECT_FALSE(check.update(0.04, {0, 0, 0, 0, 0.02, 0}));  // overshoot on joint5
+    EXPECT_FALSE(check.update(0.06, {0, 0, 0, 0, 0, 0}));
+    EXPECT_FALSE(check.update(0.10, {0, 0, 0, 0, 0, 0}));
+    EXPECT_TRUE(check.update(0.06 + TrajectoryExecutor::kSettleS, {0, 0, 0, 0, 0, 0}));
+}
+
+TEST(TrajectoryExecutorArrival, PerJointTolerance)
+{
+    TrajectoryExecutor::ArrivalCheck check({0.01, 0.01, 0.01, 0.01, 0.01, 1e9});
+    EXPECT_FALSE(check.update(0.0, {0, 0, 0, 0, 0, 5.0}));
+    EXPECT_TRUE(check.update(TrajectoryExecutor::kSettleS, {0, 0, 0, 0, 0, 5.0}));
+}

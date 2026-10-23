@@ -1,5 +1,7 @@
 #include <dobot_bringup/cr_robot_ros2.h>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <cmath>
+#include <cstdio>
 
 CRRobotRos2::CRRobotRos2() : rclcpp::Node("dobot_bringup_ros2"){};
 
@@ -306,6 +308,13 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     double servoGain = this->get_parameter("servo_gain").as_double();
     int servoRtPriority = static_cast<int>(this->get_parameter("servo_rt_priority").as_int());
 
+    // Arrival after the last point: within goal_tolerance_deg on every joint
+    // the goal gives no tolerance for, within goal_time_tolerance s.
+    this->declare_parameter("goal_tolerance_deg", 0.01);
+    this->declare_parameter("goal_time_tolerance", 1.0);
+    goal_tolerance_deg_ = this->get_parameter("goal_tolerance_deg").as_double();
+    goal_time_tolerance_ = this->get_parameter("goal_time_tolerance").as_double();
+
     trajectory_executor_ = std::make_shared<TrajectoryExecutor>(
         commander_, servoRate, servoT, servoAheadtime, servoGain, servoRtPriority);
 
@@ -323,9 +332,10 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
     RCLCPP_INFO(this->get_logger(),
                 "FollowJointTrajectory action server ready at %s "
-                "(rate=%.0f Hz, t=%.4f, ahead=%.1f, gain=%.1f)",
+                "(rate=%.0f Hz, t=%.4f, ahead=%.1f, gain=%.1f; arrival within %.3f deg, %.2f s)",
                 fjtActionName.c_str(),
-                servoRate, servoT, servoAheadtime, servoGain);
+                servoRate, servoT, servoAheadtime, servoGain,
+                goal_tolerance_deg_, goal_time_tolerance_);
 }
 
 void CRRobotRos2::pubFeedBackInfo()
@@ -1369,6 +1379,10 @@ bool CRRobotRos2::ServoP(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Reque
 // FollowJointTrajectory action server callbacks
 // ======================================================================
 
+// A trajectory's first point may be this far from the arm (deg): MoveIt's
+// allowed_start_tolerance is 0.01 rad.
+static constexpr double kStartToleranceDeg = 0.5;
+
 rclcpp_action::GoalResponse CRRobotRos2::handleGoalFJT(
     const rclcpp_action::GoalUUID & /*uuid*/,
     std::shared_ptr<const FollowJointTrajectory::Goal> /*goal*/)
@@ -1398,15 +1412,100 @@ void CRRobotRos2::executeTrajectory(
     const std::shared_ptr<GoalHandleFJT> goal_handle)
 {
     auto result = std::make_shared<FollowJointTrajectory::Result>();
-    const auto &trajectory = goal_handle->get_goal()->trajectory;
+    const auto &goal = *goal_handle->get_goal();
+    auto abortWith = [&](int32_t code, const std::string &why) {
+        RCLCPP_ERROR(this->get_logger(), "FJT: refused: %s", why.c_str());
+        result->error_code = code;
+        result->error_string = why;
+        goal_handle->abort(result);
+    };
 
-    if (trajectory.points.empty())
+    if (fjt_busy_.exchange(true))
     {
-        RCLCPP_WARN(this->get_logger(), "FJT: empty trajectory, succeeding immediately");
-        result->error_code = result->SUCCESSFUL;
-        goal_handle->succeed(result);
+        abortWith(result->INVALID_GOAL, "another trajectory is executing");
         return;
     }
+    struct Release
+    {
+        std::atomic<bool> &busy;
+        ~Release() { busy = false; }
+    } release{fjt_busy_};
+
+    std::array<size_t, 6> from{};
+    std::string why = TrajectoryExecutor::jointOrder(goal.trajectory.joint_names, from);
+    if (!why.empty())
+    {
+        abortWith(result->INVALID_JOINTS, why);
+        return;
+    }
+    trajectory_msgs::msg::JointTrajectory trajectory;
+    why = TrajectoryExecutor::toDriverOrder(goal.trajectory, trajectory);
+    if (!why.empty())
+    {
+        abortWith(result->INVALID_GOAL, why);
+        return;
+    }
+
+    // The controller must be watchable and out of alarm, and the trajectory
+    // must start where the arm is. ENABLE is not required here: after a
+    // stream the controller stays RUNNING for ~1.7 s, and the executor waits.
+    int64_t age_ms = commander_->realtimeAgeMs();
+    if (age_ms < 0 || age_ms > 500)
+    {
+        abortWith(result->PATH_TOLERANCE_VIOLATED,
+                  "realtime feedback stale (" + std::to_string(age_ms) +
+                      " ms since the last packet); check the TCP 30004 link");
+        return;
+    }
+    RealTimeData rd = commander_->getRealData();
+    if (rd.robot_mode == 9 || rd.robot_mode == 11)
+    {
+        abortWith(result->PATH_TOLERANCE_VIOLATED,
+                  "the controller is in alarm (robot mode " + std::to_string(rd.robot_mode) +
+                      "); clear it first");
+        return;
+    }
+    const auto &first = trajectory.points.front().positions;
+    double worst = 0.0;
+    size_t worst_j = 0;
+    for (size_t j = 0; j < 6; j++)
+    {
+        double off = std::fabs(TrajectoryExecutor::rad2Deg(first[j]) - rd.q_actual[j]);
+        if (off > worst)
+        {
+            worst = off;
+            worst_j = j;
+        }
+    }
+    if (worst > kStartToleranceDeg)
+    {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "the trajectory starts %.2f deg from the arm on %s (start %.3f, arm "
+                      "%.3f deg; at most %.2f)",
+                      worst, TrajectoryExecutor::kJointNames[worst_j].c_str(),
+                      TrajectoryExecutor::rad2Deg(first[worst_j]), rd.q_actual[worst_j],
+                      kStartToleranceDeg);
+        abortWith(result->INVALID_GOAL, buf);
+        return;
+    }
+
+    // Arrival: the goal's tolerances by joint name (rad; 0 means the default,
+    // negative means unchecked), else the parameters.
+    TrajectoryExecutor::GoalTolerance tolerance;
+    tolerance.position_deg.fill(goal_tolerance_deg_);
+    for (const auto &jt : goal.goal_tolerance)
+    {
+        for (size_t j = 0; j < 6; j++)
+        {
+            if (jt.name != TrajectoryExecutor::kJointNames[j] || jt.position == 0.0)
+                continue;
+            tolerance.position_deg[j] =
+                jt.position < 0.0 ? 1e9 : TrajectoryExecutor::rad2Deg(jt.position);
+        }
+    }
+    double goal_time = goal.goal_time_tolerance.sec + goal.goal_time_tolerance.nanosec / 1e9;
+    tolerance.time_s = goal_time > 0.0 ? goal_time : goal_time_tolerance_;
 
     RCLCPP_INFO(this->get_logger(),
                 "FJT: executing %zu-point trajectory (%.2f s)",
@@ -1415,7 +1514,7 @@ void CRRobotRos2::executeTrajectory(
                     trajectory.points.back().time_from_start.nanosec / 1e9);
 
     // Load and start.
-    trajectory_executor_->loadTrajectory(trajectory);
+    trajectory_executor_->loadTrajectory(trajectory, tolerance);
     trajectory_executor_->start();
 
     // Monitor loop: publish feedback, check cancellation.
@@ -1454,18 +1553,24 @@ void CRRobotRos2::executeTrajectory(
 
     // Check final state.
     auto state = trajectory_executor_->getState();
+    if (state.error_msg.empty() && !state.done)
+    {
+        trajectory_executor_->stop();
+        state.error_msg = "the trajectory was interrupted (shutting down)";
+    }
     if (!state.error_msg.empty())
     {
         RCLCPP_ERROR(this->get_logger(), "FJT: trajectory aborted: %s",
                      state.error_msg.c_str());
-        result->error_code = result->PATH_TOLERANCE_VIOLATED;
+        result->error_code = state.goal_tolerance_violated ? result->GOAL_TOLERANCE_VIOLATED
+                                                           : result->PATH_TOLERANCE_VIOLATED;
         result->error_string = state.error_msg;
         goal_handle->abort(result);
     }
     else
     {
-        RCLCPP_INFO(this->get_logger(), "FJT: trajectory succeeded (%.2f s)",
-                    state.elapsed);
+        RCLCPP_INFO(this->get_logger(), "FJT: trajectory succeeded (%.2f s), arm on the last "
+                    "point", state.elapsed);
         result->error_code = result->SUCCESSFUL;
         goal_handle->succeed(result);
     }

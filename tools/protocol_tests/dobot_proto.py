@@ -251,9 +251,14 @@ class Dashboard:
     send() and recv_reply() are separate so a test can pipeline: send several
     commands, then read the replies. Replies are split on ';' and buffered, so
     two replies arriving in one TCP segment are handled.
+
+    With DOBOT_TRACE set to a file path, every query() is appended to it:
+    send time, round trip, command and reply.
     """
 
     def __init__(self, ip, port=DASH_PORT, timeout=2.0, nodelay=True):
+        trace = os.environ.get('DOBOT_TRACE')
+        self._trace = open(trace, 'a') if trace else None
         self.sock = socket.create_connection((ip, port), timeout=3.0)
         if nodelay:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -287,6 +292,10 @@ class Dashboard:
     def query(self, cmd):
         t_send = self.send(cmd)
         raw, t_recv = self.recv_reply()
+        if self._trace:
+            self._trace.write('%.4f %6.1f ms  %s  ->  %s\n' % (
+                t_send, (t_recv - t_send) * 1e3, cmd, raw))
+            self._trace.flush()
         return Reply(raw, t_send, t_recv)
 
 

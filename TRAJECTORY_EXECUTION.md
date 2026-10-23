@@ -42,6 +42,7 @@ MoveIt (plan_only)
 │    ├─ handleGoalFJT()    → accept                │
 │    ├─ handleCancelFJT()  → stop executor         │
 │    └─ executeTrajectory() (detached thread)       │
+│         checks the goal, one at a time            │
 │         │                                        │
 │         ▼                                        │
 │  TrajectoryExecutor                              │
@@ -52,6 +53,7 @@ MoveIt (plan_only)
 │    │    ├─ check robot_mode from real-time data  │
 │    │    ├─ sendServoCommand() → dashboard TCP    │
 │    │    └─ drift-compensated sleep               │
+│    ├─ settle()          wait for arrival         │
 │    └─ stop()            send Stop(), join thread │
 │                                                  │
 │  Existing services (MovJ, MovL, etc.)            │
@@ -68,7 +70,18 @@ MoveIt (plan_only)
 ## How It Works
 
 1. MoveIt plans a trajectory with variable-time waypoints in joint space (radians).
-2. The `FollowJointTrajectory` action server receives the trajectory.
+2. The `FollowJointTrajectory` action server receives the trajectory and checks it before any
+   motion. The goal is aborted, with the reason in `error_string`, when:
+   - another trajectory is executing (`INVALID_GOAL`): the running one carries on;
+   - its `joint_names` are not `joint1`…`joint6` in any order (`INVALID_JOINTS`); points are
+     reordered by name;
+   - it has no points, a point with the wrong number of positions or a non-finite one, or
+     times that go backwards (`INVALID_GOAL`);
+   - its first point is more than 0.5° from the arm on any joint (`INVALID_GOAL`);
+   - the realtime feed is stale, or the controller is in alarm (`PATH_TOLERANCE_VIOLATED`).
+
+   The controller need not be in ENABLE yet: after a stream it stays RUNNING for ~1.7 s, and
+   the executor waits up to 10 s for ENABLE before the first ServoJ.
 3. `TrajectoryExecutor::loadTrajectory()` converts radians to degrees and stores the waypoints.
 4. `servoLoop()` runs in a dedicated thread:
    - Reads wall-clock elapsed time since start.
@@ -77,7 +90,19 @@ MoveIt (plan_only)
    - Formats a `ServoJ(j1,j2,...,j6,t=T,aheadtime=A,gain=G)` command.
    - Sends it via `sendServoCommand()` — direct TCP with minimal overhead, no per-call logging.
    - Sleeps until `start_time + iteration * period` (drift-compensated).
-5. The action server publishes feedback at 20 Hz (desired/actual/error in radians) and reports success or abort when the loop finishes.
+   - Sends `Stop()` and aborts when the feed is more than 100 ms old: the arm would be moving
+     unwatched.
+5. After the last point nothing more is sent: no repeat of the final point, no `Stop()` (which
+   halts the arm ~0.1° short). `settle()` waits for every joint to stay within its goal
+   tolerance of the last point for 50 ms. The bench arm arrives 0.2–0.6 s after the last point;
+   the controller's own target overshoots by ~0.075° and creeps back (t18, 2026-10-22).
+6. The action server publishes feedback at 20 Hz (desired/actual/error in radians). It reports
+   success only once the arm has arrived; `GOAL_TOLERANCE_VIOLATED` if it does not arrive in
+   time; `PATH_TOLERANCE_VIOLATED` for an alarm, a rejected ServoJ or a stale feed during the
+   stream. A cancel during the stream sends `Stop()` and reports `CANCELED`. A cancel while
+   waiting for arrival sends nothing: `Stop()` on a servo session whose arm has arrived,
+   followed by a MovL and then a MovJ, made the next stream drive J1 the wrong way (alarms
+   225/227) on the bench.
 
 ## Thread Safety
 
@@ -96,6 +121,9 @@ Added to the `dobot_bringup_ros2` node:
 | `servo_rate` | 50.0 | ServoJ streaming rate (Hz). The ServoJ time parameter (`t`) is derived as 1/servo_rate. |
 | `servo_aheadtime` | 50.0 | Controller lookahead / D-term [20..100] |
 | `servo_gain` | 500.0 | Controller proportional gain [200..1000] |
+| `servo_rt_priority` | 80 | SCHED_FIFO priority of the servo thread; 0 keeps normal scheduling |
+| `goal_tolerance_deg` | 0.01 | Arrival tolerance (°) for every joint the goal's `goal_tolerance` leaves at 0. A negative goal tolerance leaves that joint unchecked |
+| `goal_time_tolerance` | 1.0 | Time (s) after the last point to arrive in, when the goal's `goal_time_tolerance` is 0 |
 
 ## Action Server Interface
 
@@ -105,9 +133,12 @@ Where `{robot_type}` comes from the `robot_type` parameter (default: `cr5`).
 
 **Type:** `control_msgs/action/FollowJointTrajectory`
 
-- **Goal:** `trajectory` field (JointTrajectory with positions in radians)
+- **Goal:** `trajectory` (JointTrajectory, positions in radians, joints by name);
+  `goal_tolerance` (position, rad, by joint name) and `goal_time_tolerance` are honoured
 - **Feedback:** `desired`, `actual`, `error` (TrajectoryPoint, radians) at 20 Hz
-- **Result:** `SUCCESSFUL` (0) or `PATH_TOLERANCE_VIOLATED` (-4) with error string
+- **Result:** `SUCCESSFUL` (0), `INVALID_GOAL` (-1), `INVALID_JOINTS` (-2),
+  `PATH_TOLERANCE_VIOLATED` (-4) or `GOAL_TOLERANCE_VIOLATED` (-5), with the reason in
+  `error_string`
 
 ## Tuning
 

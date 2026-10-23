@@ -15,6 +15,8 @@ static const rclcpp::Logger kLogger = rclcpp::get_logger("trajectory_executor");
 // missed packets — comfortably past any jitter, and short of the ~3 s a
 // reconnect takes, so a genuine blip still gets the full 10 s wait below.
 static constexpr int64_t kRealtimeStaleMs = 500;
+// While streaming, a feed this old means the arm is moving unwatched.
+static constexpr int64_t kStreamStaleMs = 100;
 
 namespace
 {
@@ -78,6 +80,79 @@ void logRecentSends(const std::deque<SentServo> &sends, double servo_t)
 }
 }  // namespace
 
+const std::array<std::string, 6> TrajectoryExecutor::kJointNames{
+    "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"};
+
+std::string TrajectoryExecutor::jointOrder(const std::vector<std::string> &joint_names,
+                                          std::array<size_t, 6> &from)
+{
+    if (joint_names.size() != kJointNames.size())
+        return "the trajectory names " + std::to_string(joint_names.size()) +
+               " joints; the arm has " + std::to_string(kJointNames.size());
+    for (size_t j = 0; j < kJointNames.size(); j++)
+    {
+        auto it = std::find(joint_names.begin(), joint_names.end(), kJointNames[j]);
+        if (it == joint_names.end())
+            return "the trajectory has no " + kJointNames[j];
+        from[j] = static_cast<size_t>(it - joint_names.begin());
+    }
+    return "";
+}
+
+std::string TrajectoryExecutor::toDriverOrder(
+    const trajectory_msgs::msg::JointTrajectory &traj,
+    trajectory_msgs::msg::JointTrajectory &out)
+{
+    std::array<size_t, 6> from{};
+    std::string why = jointOrder(traj.joint_names, from);
+    if (!why.empty())
+        return why;
+    if (traj.points.empty())
+        return "the trajectory has no points";
+
+    out = trajectory_msgs::msg::JointTrajectory{};
+    out.header = traj.header;
+    out.joint_names.assign(kJointNames.begin(), kJointNames.end());
+    double previous = 0.0;
+    for (size_t i = 0; i < traj.points.size(); i++)
+    {
+        const auto &pt = traj.points[i];
+        if (pt.positions.size() != kJointNames.size())
+            return "point " + std::to_string(i) + " has " + std::to_string(pt.positions.size()) +
+                   " positions";
+        double t = pt.time_from_start.sec + pt.time_from_start.nanosec / 1e9;
+        if (t < previous)
+            return "point " + std::to_string(i) + " is earlier than the one before it";
+        previous = t;
+        trajectory_msgs::msg::JointTrajectoryPoint p;
+        p.time_from_start = pt.time_from_start;
+        for (size_t j = 0; j < kJointNames.size(); j++)
+        {
+            double q = pt.positions[from[j]];
+            if (!std::isfinite(q))
+                return "point " + std::to_string(i) + " has a non-finite position";
+            p.positions.push_back(q);
+        }
+        out.points.push_back(p);
+    }
+    return "";
+}
+
+bool TrajectoryExecutor::ArrivalCheck::update(double t, const std::array<double, 6> &offset_deg)
+{
+    for (size_t j = 0; j < 6; j++)
+    {
+        if (std::fabs(offset_deg[j]) > tolerance_[j])
+        {
+            within_since_ = -1.0;
+            return false;
+        }
+    }
+    if (within_since_ < 0.0)
+        within_since_ = t;
+    return t - within_since_ >= kSettleS;
+}
+
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
     double servo_rate, double servo_t,
@@ -101,12 +176,19 @@ TrajectoryExecutor::~TrajectoryExecutor()
     stop();
 }
 
+void TrajectoryExecutor::loadTrajectory(const trajectory_msgs::msg::JointTrajectory &traj)
+{
+    loadTrajectory(traj, GoalTolerance{});
+}
+
 void TrajectoryExecutor::loadTrajectory(
-    const trajectory_msgs::msg::JointTrajectory &traj)
+    const trajectory_msgs::msg::JointTrajectory &traj,
+    const GoalTolerance &tolerance)
 {
     stop();
 
     std::lock_guard<std::mutex> lock(mutex_);
+    tolerance_ = tolerance;
     timestamps_.clear();
     joints_deg_.clear();
 
@@ -150,6 +232,7 @@ void TrajectoryExecutor::start()
         }
         state_.done = false;
         state_.error_msg.clear();
+        state_.goal_tolerance_violated = false;
         state_.elapsed = 0.0;
     }
 
@@ -162,13 +245,17 @@ void TrajectoryExecutor::stop()
     if (!running_)
         return;
 
+    // Once streamed, the arm is settling on the last point and Stop() has
+    // nothing to halt. It would only end the servo session early, which on the
+    // CR5 can make a later stream lurch the wrong way (Stop() on an arrived
+    // session, then MovL, then MovJ: alarms 225/227; bench, 2026-10-22).
+    bool streamed = settling_;
     running_ = false;
 
     if (thread_.joinable())
         thread_.join();
 
-    // Flush the Dobot controller's internal command queue.
-    if (commander_)
+    if (commander_ && !streamed)
     {
         int32_t err_id = 0;
         commander_->sendServoCommand("Stop()", err_id);
@@ -178,6 +265,14 @@ void TrajectoryExecutor::stop()
 bool TrajectoryExecutor::isRunning() const
 {
     return running_;
+}
+
+void TrajectoryExecutor::fail(const std::string &msg)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    state_.error_msg = msg;
+    state_.done = true;
+    RCLCPP_ERROR(kLogger, "%s", msg.c_str());
 }
 
 TrajectoryExecutor::State TrajectoryExecutor::getState() const
@@ -357,37 +452,23 @@ void TrajectoryExecutor::servoLoop()
         // The trajectory point for this command's slot, whenever it is sent.
         double elapsed = static_cast<double>(iteration) * period;
 
-        // Trajectory complete?
+        // Streamed to the end: wait for the arm to settle on the last point.
         if (elapsed >= total_duration)
         {
-            // Send the final point one more time to ensure convergence.
             std::array<double, 6> final_target;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 final_target = joints_deg_.back();
+                state_.elapsed = total_duration;
+                state_.desired = final_target;
             }
-
-            char cmd[256];
-            std::snprintf(cmd, sizeof(cmd),
-                          "ServoJ(%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-                          "t=%.4f,aheadtime=%.1f,gain=%.1f)",
-                          final_target[0], final_target[1], final_target[2],
-                          final_target[3], final_target[4], final_target[5],
-                          servo_t_, aheadtime_, gain_);
-
-            int32_t err_id = 0;
-            commander_->sendServoCommand(std::string(cmd), err_id);
-
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.elapsed = total_duration;
-            state_.desired = final_target;
-            state_.done = true;
-            RCLCPP_INFO(kLogger, "Trajectory complete: %.2f s (planned %.2f s), longest gap "
+            RCLCPP_INFO(kLogger, "Trajectory streamed: %.2f s (planned %.2f s), longest gap "
                         "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
                         "than 1 ms late; latest wake-up %.1f ms, slowest reply %.1f ms",
                         since_start(std::chrono::steady_clock::now()), total_duration,
                         max_gap_ms, 1000.0 / servo_rate_, late_sends, max_wake_late_ms,
                         max_reply_ms);
+            settle(final_target);
             break;
         }
 
@@ -396,6 +477,19 @@ void TrajectoryExecutor::servoLoop()
         {
             std::lock_guard<std::mutex> lock(mutex_);
             target = interpolate(elapsed);
+        }
+
+        // The feed is how the stream sees the arm; without it, stop the arm.
+        int64_t age_ms = commander_->realtimeAgeMs();
+        if (age_ms < 0 || age_ms > kStreamStaleMs)
+        {
+            int32_t stop_err = 0;
+            commander_->sendServoCommand("Stop()", stop_err);
+            fail("Realtime feedback stale (" + std::to_string(age_ms) +
+                 " ms since the last packet) during the trajectory; the arm was stopped. "
+                 "Check the TCP 30004 link");
+            logRecentSends(recent, servo_t_);
+            break;
         }
 
         // Check robot mode from real-time data.
@@ -482,4 +576,69 @@ void TrajectoryExecutor::servoLoop()
     }
 
     running_ = false;
+}
+
+void TrajectoryExecutor::settle(const std::array<double, 6> &final_target)
+{
+    GoalTolerance tolerance;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tolerance = tolerance_;
+    }
+    ArrivalCheck arrival(tolerance.position_deg);
+    settling_ = true;
+    struct Settled
+    {
+        std::atomic<bool> &flag;
+        ~Settled() { flag = false; }
+    } settled{settling_};
+    auto start = std::chrono::steady_clock::now();
+    std::array<double, 6> offset{};
+    while (running_)
+    {
+        double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        int64_t age_ms = commander_->realtimeAgeMs();
+        if (age_ms < 0 || age_ms > kStreamStaleMs)
+        {
+            fail("Realtime feedback stale (" + std::to_string(age_ms) +
+                 " ms since the last packet) while the arm settled; arrival unknown. "
+                 "Check the TCP 30004 link");
+            return;
+        }
+        RealTimeData rd = commander_->getRealData();
+        if (rd.robot_mode == 9 || rd.robot_mode == 11)
+        {
+            fail("Robot entered error mode " + std::to_string(rd.robot_mode) +
+                 " while settling on the last point");
+            return;
+        }
+        for (size_t j = 0; j < 6; j++)
+            offset[j] = rd.q_actual[j] - final_target[j];
+        if (arrival.update(t, offset))
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (size_t j = 0; j < 6; j++)
+            {
+                state_.actual[j] = rd.q_actual[j];
+                state_.error[j] = -offset[j];
+            }
+            state_.done = true;
+            RCLCPP_INFO(kLogger, "Arrived %.0f ms after the last point: offset %s deg",
+                        t * 1e3, joints(offset).c_str());
+            return;
+        }
+        if (t > tolerance.time_s)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_.goal_tolerance_violated = true;
+            }
+            char limit[32];
+            std::snprintf(limit, sizeof(limit), "%.2f", tolerance.time_s);
+            fail("The arm did not settle within " + joints(tolerance.position_deg) +
+                 " deg of the last point in " + limit + " s: offset " + joints(offset) + " deg");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+    }
 }
