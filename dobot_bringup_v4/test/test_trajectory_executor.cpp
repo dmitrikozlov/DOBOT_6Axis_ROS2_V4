@@ -513,3 +513,44 @@ TEST(TrajectoryExecutorArrival, PerJointTolerance)
     EXPECT_FALSE(check.update(0.0, {0, 0, 0, 0, 0, 5.0}));
     EXPECT_TRUE(check.update(TrajectoryExecutor::kSettleS, {0, 0, 0, 0, 0, 5.0}));
 }
+
+// --- Start-of-stream fault -----------------------------------------------------
+
+TEST(TrajectoryExecutorStartFault, FollowingTheCommandsIsNoFault)
+{
+    // Commands J1 -90.50 -> -90.39; the controller's target lags between them.
+    std::array<double, 6> start{-90.50, 45.68, -95.11, -15.44, 90.49, 0.41};
+    std::array<double, 6> lo = start, hi = start;
+    hi[0] = -90.39;
+    std::array<double, 6> ctrl = start;
+    ctrl[0] = -90.45;
+    EXPECT_EQ(TrajectoryExecutor::startFault(start, lo, hi, ctrl), "");
+    ctrl[0] = -90.39 + 0.04;   // within kStartFaultDeg of the range
+    EXPECT_EQ(TrajectoryExecutor::startFault(start, lo, hi, ctrl), "");
+}
+
+TEST(TrajectoryExecutorStartFault, EveryJointTowardZero)
+{
+    // Bench 2026-10-23 (case 4): 25 ms in, every joint 0.1562 % toward 0.
+    std::array<double, 6> start{-35.733, 43.658, -95.110, -15.389, 90.493, 0.414};
+    std::array<double, 6> lo = start, hi = start;
+    lo[0] = -35.745;                                   // commands so far
+    std::array<double, 6> ctrl{-35.677, 43.590, -94.964, -15.365, 90.352, 0.413};
+    std::string what = TrajectoryExecutor::startFault(start, lo, hi, ctrl);
+    EXPECT_NE(what.find("every joint moved toward 0"), std::string::npos) << what;
+    EXPECT_NE(what.find("0.15"), std::string::npos) << what;
+}
+
+TEST(TrajectoryExecutorStartFault, OneJointAgainstTheCommands)
+{
+    // Bench 2026-10-22 (lurch after Stop()): J1 commanded up from -99.147,
+    // the controller's target went down.
+    std::array<double, 6> start{-99.147, 45.682, -95.105, -15.441, 90.493, 0.413};
+    std::array<double, 6> lo = start, hi = start;
+    hi[0] = -99.114;
+    std::array<double, 6> ctrl = start;
+    ctrl[0] = -99.410;
+    std::string what = TrajectoryExecutor::startFault(start, lo, hi, ctrl);
+    EXPECT_NE(what.find("joint1 moved to -99.410"), std::string::npos) << what;
+    EXPECT_NE(what.find("0.26 deg outside"), std::string::npos) << what;
+}

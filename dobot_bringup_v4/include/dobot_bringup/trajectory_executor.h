@@ -107,6 +107,21 @@ public:
     // How late a send may be and still keep the schedule (s): wake-up jitter.
     static constexpr double kLateSend = 0.001;
 
+    // At a stream's start the controller's target follows the commands, behind
+    // them, so it stays within the range of the commands sent so far and its
+    // own target before the stream ([lo, hi] per joint, deg). On the CR5 it
+    // can instead leave that range at once: every joint toward 0 by the same
+    // fraction of its angle, or one joint against the commanded direction
+    // (after Stop() on an arrived stream). Returns what the target did, or an
+    // empty string while it stays within kStartFaultDeg of the range. start:
+    // the stream's first point.
+    static std::string startFault(const std::array<double, 6> &start,
+                                  const std::array<double, 6> &lo,
+                                  const std::array<double, 6> &hi,
+                                  const std::array<double, 6> &ctrl_target);
+    static constexpr double kStartFaultDeg = 0.05;
+    static constexpr double kStartWatchS = 0.5;   // how long into a stream it is checked
+
     // Arrival: true once every joint's offset from the last point has stayed
     // within its tolerance for kSettleS of feed time.
     class ArrivalCheck

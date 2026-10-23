@@ -92,6 +92,14 @@ MoveIt (plan_only)
    - Sleeps until `start_time + iteration * period` (drift-compensated).
    - Sends `Stop()` and aborts when the feed is more than 100 ms old: the arm would be moving
      unwatched.
+   - For the first 0.5 s, checks that the controller's own target (`q_target`) stays within
+     0.05° of the range of the commands sent so far and its target before the stream. On the
+     CR5 it sometimes leaves it at once: every joint toward 0° by the same fraction of its
+     angle, or, after `Stop()` on a stream whose arm had arrived, one joint against the
+     commanded direction. The controller raises its own alarm (225, 227) within ~75 ms. The
+     driver stops sending and aborts with what the target did, how far into the stream and
+     the controller's uptime, and logs the last commands. It sends no `Stop()` and does not
+     retry: the alarm and the `ClearError` after it are what reset the controller.
 5. After the last point nothing more is sent: no repeat of the final point, no `Stop()` (which
    halts the arm ~0.1° short). `settle()` waits for every joint to stay within its goal
    tolerance of the last point for 50 ms. The bench arm arrives 0.2–0.6 s after the last point;

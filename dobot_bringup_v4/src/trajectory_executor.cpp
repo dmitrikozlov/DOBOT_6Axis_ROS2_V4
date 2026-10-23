@@ -138,6 +138,55 @@ std::string TrajectoryExecutor::toDriverOrder(
     return "";
 }
 
+std::string TrajectoryExecutor::startFault(const std::array<double, 6> &start,
+                                          const std::array<double, 6> &lo,
+                                          const std::array<double, 6> &hi,
+                                          const std::array<double, 6> &ctrl_target)
+{
+    size_t worst_j = 0;
+    double worst = 0.0;
+    for (size_t j = 0; j < 6; j++)
+    {
+        double out = std::max(lo[j] - ctrl_target[j], ctrl_target[j] - hi[j]);
+        if (out > worst)
+        {
+            worst = out;
+            worst_j = j;
+        }
+    }
+    if (worst <= kStartFaultDeg)
+        return "";
+
+    // Every joint that is not near 0 moved toward 0 by a fraction of its angle.
+    std::vector<double> fractions;
+    bool toward_zero = true;
+    for (size_t j = 0; j < 6; j++)
+    {
+        if (std::fabs(start[j]) < 1.0)
+            continue;
+        double f = (start[j] - ctrl_target[j]) / start[j];
+        toward_zero = toward_zero && f > 0.0;
+        fractions.push_back(f);
+    }
+    char buf[200];
+    if (toward_zero && fractions.size() >= 3)
+    {
+        std::sort(fractions.begin(), fractions.end());
+        std::snprintf(buf, sizeof(buf),
+                      "every joint moved toward 0 deg by %.3f %% of its angle (%.3f-%.3f %%)",
+                      fractions[fractions.size() / 2] * 100.0, fractions.front() * 100.0,
+                      fractions.back() * 100.0);
+    }
+    else
+    {
+        std::snprintf(buf, sizeof(buf),
+                      "%s moved to %.3f deg, %.2f deg outside the commanded %.3f..%.3f deg",
+                      kJointNames[worst_j].c_str(), ctrl_target[worst_j], worst,
+                      lo[worst_j], hi[worst_j]);
+    }
+    return buf;
+}
+
 bool TrajectoryExecutor::ArrivalCheck::update(double t, const std::array<double, 6> &offset_deg)
 {
     for (size_t j = 0; j < 6; j++)
@@ -408,6 +457,11 @@ void TrajectoryExecutor::servoLoop()
     // Where the controller is aiming before the first command. A target away
     // from the arm means it still holds an earlier motion's, and streaming
     // may start by driving towards it.
+    std::array<double, 6> lo{}, hi{}, first{};  // the start-of-stream check (startFault)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first = joints_deg_.front();
+    }
     {
         RealTimeData rd = commander_->getRealData();
         std::array<double, 6> ctrl{}, actual{};
@@ -424,7 +478,26 @@ void TrajectoryExecutor::servoLoop()
         else
             RCLCPP_INFO(kLogger, "Before streaming: the controller's target is on the arm "
                         "(within %.3f deg)", worst);
+        lo = hi = ctrl;
     }
+    // Why the controller's target left the commanded path, with when and the
+    // controller's uptime; empty past kStartWatchS or while it follows.
+    auto start_fault = [&](double elapsed, const RealTimeData &rd) -> std::string {
+        if (elapsed > kStartWatchS)
+            return "";
+        std::array<double, 6> ctrl{};
+        for (size_t j = 0; j < 6; j++)
+            ctrl[j] = rd.q_target[j];
+        std::string what = startFault(first, lo, hi, ctrl);
+        if (what.empty())
+            return "";
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "%.0f ms into the stream (controller up %llu s) the controller's target "
+                      "left the commanded path: ",
+                      elapsed * 1e3, static_cast<unsigned long long>(rd.run_time));
+        return buf + what + " — a controller fault, not the trajectory";
+    };
 
     auto start_time = std::chrono::steady_clock::now();
     const double period = 1.0 / servo_rate_;
@@ -495,17 +568,26 @@ void TrajectoryExecutor::servoLoop()
         // Check robot mode from real-time data.
         RealTimeData real_data = commander_->getRealData();
         uint64_t mode = real_data.robot_mode;
+        std::string fault = start_fault(elapsed, real_data);
         if (mode == 9 || mode == 11)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.error_msg =
-                "Robot entered error mode " + std::to_string(mode);
-            state_.done = true;
-            RCLCPP_ERROR(kLogger,
-                         "Robot mode %lu — aborting trajectory",
-                         static_cast<unsigned long>(mode));
+            fail("Robot entered error mode " + std::to_string(mode) +
+                 (fault.empty() ? "" : "; " + fault));
             logRecentSends(recent, servo_t_);
             break;
+        }
+        // The controller alarms by itself within ~75 ms, and that alarm and the
+        // ClearError after it are what reset its state: no Stop(), no retry.
+        if (!fault.empty())
+        {
+            fail(fault);
+            logRecentSends(recent, servo_t_);
+            break;
+        }
+        for (size_t j = 0; j < 6; j++)
+        {
+            lo[j] = std::min(lo[j], target[j]);
+            hi[j] = std::max(hi[j], target[j]);
         }
 
         // Format and send ServoJ command.
@@ -544,11 +626,11 @@ void TrajectoryExecutor::servoLoop()
 
         if (!ok || err_id != 0)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.error_msg =
-                "ServoJ failed: err_id=" + std::to_string(err_id);
-            state_.done = true;
-            RCLCPP_ERROR(kLogger, "ServoJ failed: err_id=%d", err_id);
+            // A rejection at the start is how the fault usually shows; the
+            // feed tells which.
+            std::string why = start_fault(elapsed, commander_->getRealData());
+            fail("ServoJ failed: err_id=" + std::to_string(err_id) +
+                 (why.empty() ? "" : "; " + why));
             logRecentSends(recent, servo_t_);
             break;
         }
