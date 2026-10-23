@@ -76,3 +76,9 @@ untouched apart from a one-line pointer to this document, so upstream
 README edits merge cleanly. Upstream additions that do not touch the
 files listed above (for example, new robot variants such as CR10AF or
 new service definitions) merge without conflict.
+
+Files keep the line endings upstream gives them: 16 are CRLF (`git ls-files
+--eol | grep i/crlf`), among them `cr_robot_ros2.cpp` and `.h`, so our commits
+apply to upstream as they are. `tools/git-hooks/pre-commit` refuses a commit
+that changes a file's endings; install it once per clone with
+`git config core.hooksPath tools/git-hooks`.

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Refuse a commit that changes a file's line endings.
+#
+# Files from Dobot upstream keep the endings upstream has (some are CRLF), so
+# our commits apply to upstream as they are. An editor or script that rewrites
+# a CRLF file as LF (or the reverse) makes every line show as changed; this
+# compares each modified text file's staged endings with its committed ones.
+#
+# Install once per clone:  git config core.hooksPath tools/git-hooks
+# Bypass deliberately:     git commit --no-verify
+set -uo pipefail
+
+# lf, crlf or mixed, for the file content on stdin.
+style() {
+    local data crlf lines
+    data=$(cat; printf x)
+    crlf=$(printf '%s' "${data%x}" | LC_ALL=C grep -c $'\r$')
+    lines=$(printf '%s' "${data%x}" | LC_ALL=C tr -cd '\n' | wc -c | tr -d ' ')
+    if [ "$crlf" -eq 0 ]; then echo lf
+    elif [ "$crlf" -ge "$lines" ]; then echo crlf
+    else echo mixed
+    fi
+}
+
+bad=0
+while IFS=$'\t' read -r added removed path; do
+    [ "$added" = "-" ] && continue                  # binary
+    before=$(git show "HEAD:$path" | style)
+    after=$(git show ":$path" | style)
+    if [ "$before" != mixed ] && [ "$before" != "$after" ]; then
+        echo "pre-commit: $path: line endings $before in HEAD, $after staged" >&2
+        bad=1
+    fi
+done < <(git diff --cached --numstat --diff-filter=M)
+
+if [ "$bad" -ne 0 ]; then
+    cat >&2 <<'MSG'
+pre-commit: restore the committed endings, then stage again. For a CRLF file:
+    python3 -c "import sys; p=sys.argv[1]; b=open(p,'rb').read().replace(b'\r\n',b'\n'); open(p,'wb').write(b.replace(b'\n',b'\r\n'))" FILE
+MSG
+    exit 1
+fi
