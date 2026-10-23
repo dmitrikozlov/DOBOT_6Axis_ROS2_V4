@@ -61,7 +61,8 @@ def main():
         raise SystemExit('no FJT server')
     q0 = b.q()
 
-    b.run('first goal, J1 +%g deg' % distance, fb.goal_for(q0, 0, distance), 'SUCCESSFUL')
+    if not b.run('first goal, J1 +%g deg' % distance, fb.goal_for(q0, 0, distance), 'SUCCESSFUL'):
+        raise SystemExit('the first goal failed: clear the alarm and start again')
     print('Stop:', call(b, Stop, 'Stop').res, ' mode', dp.mode_name(wait_idle(rt)))
     pose = call(b, GetPose, 'GetPose', user=0, tool=1).robot_return
     xyz = [float(v) for v in pose[pose.index('{') + 1:pose.index('}')].split(',')[:6]]
