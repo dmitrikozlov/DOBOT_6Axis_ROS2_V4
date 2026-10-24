@@ -534,6 +534,7 @@ void TrajectoryExecutor::servoLoop()
                 final_target = joints_deg_.back();
                 state_.elapsed = total_duration;
                 state_.desired = final_target;
+                state_.desired_vel = {};
             }
             RCLCPP_INFO(kLogger, "Trajectory streamed: %.2f s (planned %.2f s), longest gap "
                         "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
@@ -638,13 +639,15 @@ void TrajectoryExecutor::servoLoop()
         // Update state.
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            state_.elapsed = elapsed;
-            state_.desired = target;
             for (size_t i = 0; i < 6; i++)
             {
+                state_.desired_vel[i] = iteration > 0 ? (target[i] - state_.desired[i]) / period : 0.0;
                 state_.actual[i] = real_data.q_actual[i];
+                state_.actual_vel[i] = real_data.qd_actual[i];
                 state_.error[i] = target[i] - real_data.q_actual[i];
             }
+            state_.elapsed = elapsed;
+            state_.desired = target;
         }
 
         iteration++;
@@ -694,16 +697,19 @@ void TrajectoryExecutor::settle(const std::array<double, 6> &final_target)
                  " while settling on the last point");
             return;
         }
-        for (size_t j = 0; j < 6; j++)
-            offset[j] = rd.q_actual[j] - final_target[j];
-        if (arrival.update(t, offset))
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (size_t j = 0; j < 6; j++)
             {
+                offset[j] = rd.q_actual[j] - final_target[j];
                 state_.actual[j] = rd.q_actual[j];
+                state_.actual_vel[j] = rd.qd_actual[j];
                 state_.error[j] = -offset[j];
             }
+        }
+        if (arrival.update(t, offset))
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
             state_.done = true;
             RCLCPP_INFO(kLogger, "Arrived %.0f ms after the last point: offset %s deg",
                         t * 1e3, joints(offset).c_str());

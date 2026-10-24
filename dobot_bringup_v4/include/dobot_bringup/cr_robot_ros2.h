@@ -153,6 +153,7 @@ class CRRobotRos2 : public rclcpp::Node
 {
 public:
     CRRobotRos2();
+    ~CRRobotRos2() override;
     void init();
     static void execute_action(const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Request> request,
                                std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response);
@@ -443,6 +444,10 @@ private:
     std::shared_ptr<TrajectoryExecutor> trajectory_executor_;
     rclcpp_action::Server<FollowJointTrajectory>::SharedPtr fjt_action_server_;
     std::atomic<bool> fjt_busy_{false};    // a goal is executing; others are refused
+    std::thread fjt_thread_;               // the goal's executeTrajectory
+    std::atomic<bool> threads_stopped_{false};
+    rclcpp::PreShutdownCallbackHandle pre_shutdown_;
+    void stopThreads();
     double goal_tolerance_deg_ = 0.01;     // arrival, for joints the goal leaves at 0
     double goal_time_tolerance_ = 1.0;     // s after the last point, if the goal gives none
 };

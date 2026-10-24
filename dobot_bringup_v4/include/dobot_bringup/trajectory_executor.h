@@ -79,6 +79,8 @@ public:
         std::array<double, 6> desired{};  // current target (degrees)
         std::array<double, 6> actual{};   // from real-time feedback (degrees)
         std::array<double, 6> error{};    // desired - actual (degrees)
+        std::array<double, 6> desired_vel{};  // deg/s, of the commanded target
+        std::array<double, 6> actual_vel{};   // deg/s, measured
         bool done = false;
         std::string error_msg;            // non-empty on failure
         bool goal_tolerance_violated = false;  // streamed, but did not arrive

@@ -41,7 +41,7 @@ MoveIt (plan_only)
 │  FollowJointTrajectory action server             │
 │    ├─ handleGoalFJT()    → accept                │
 │    ├─ handleCancelFJT()  → stop executor         │
-│    └─ executeTrajectory() (detached thread)       │
+│    └─ executeTrajectory() (own thread, joined)    │
 │         checks the goal, one at a time            │
 │         │                                        │
 │         ▼                                        │
@@ -104,7 +104,8 @@ MoveIt (plan_only)
    halts the arm ~0.1° short). `settle()` waits for every joint to stay within its goal
    tolerance of the last point for 50 ms. The bench arm arrives 0.2–0.6 s after the last point;
    the controller's own target overshoots by ~0.075° and creeps back (t18, 2026-10-22).
-6. The action server publishes feedback at 20 Hz (desired/actual/error in radians). It reports
+6. The action server publishes feedback at 20 Hz (stamped; desired/actual/error positions and
+   velocities in radians; `time_from_start` the trajectory time of the latest command). It reports
    success only once the arm has arrived; `GOAL_TOLERANCE_VIOLATED` if it does not arrive in
    time; `PATH_TOLERANCE_VIOLATED` for an alarm, a rejected ServoJ or a stale feed during the
    stream. A cancel during the stream sends `Stop()` and reports `CANCELED`. A cancel while
@@ -119,6 +120,13 @@ A `dash_mutex_` in `CRCommanderRos2` serialises all dashboard TCP access. Both `
 - Service calls during trajectory execution will briefly block the servo loop (and vice versa).
 - For smooth execution, avoid calling dashboard services while a trajectory is running.
 - The real-time feedback channel (port 30004) is read-only and unaffected.
+
+Each goal runs in its own thread, and the status publisher in another; the node
+keeps both and joins them. On shutdown a pre-shutdown callback stops a running
+stream (`Stop()` halts the arm), lets the goal report its result (aborted, "the
+trajectory was interrupted") while ROS can still send it, and joins both threads.
+A goal handle left without a result would throw from its destructor once ROS is
+down, and that terminates the process.
 
 ## ROS Parameters
 
@@ -143,7 +151,8 @@ Where `{robot_type}` comes from the `robot_type` parameter (default: `cr5`).
 
 - **Goal:** `trajectory` (JointTrajectory, positions in radians, joints by name);
   `goal_tolerance` (position, rad, by joint name) and `goal_time_tolerance` are honoured
-- **Feedback:** `desired`, `actual`, `error` (TrajectoryPoint, radians) at 20 Hz
+- **Feedback:** `header.stamp`; `desired`, `actual`, `error` (TrajectoryPoint: positions and
+  velocities in radians, `time_from_start`) at 20 Hz
 - **Result:** `SUCCESSFUL` (0), `INVALID_GOAL` (-1), `INVALID_JOINTS` (-2),
   `PATH_TOLERANCE_VIOLATED` (-4) or `GOAL_TOLERANCE_VIOLATED` (-5), with the reason in
   `error_string`
