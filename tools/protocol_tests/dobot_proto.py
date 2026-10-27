@@ -24,6 +24,7 @@ from collections import deque
 DEFAULT_IP = '192.168.5.1'
 DASH_PORT = 29999
 RT_PORT = 30004
+CTRL_LOG_PORT = 65511   # the controller's own text log, sent to any client that connects
 PACKET_SIZE = 1440
 TEST_VALUE = 0x0123456789ABCDEF
 
@@ -72,6 +73,8 @@ _ARRAYS = [
     ('tcp_speed_actual', 672),
     ('tcp_speed_target', 816),
     ('m_actual', 1120),
+    ('tool_vector_actual', 624),   # tool pose, mm and deg, in the current User/Tool
+    ('tool_vector_target', 768),
 ]
 _SCALAR_STRUCTS = [(n, struct.Struct(f), o) for n, f, o in _SCALARS]
 _ARRAY6 = struct.Struct('<6d')
@@ -113,6 +116,10 @@ class RealtimeReader(threading.Thread):
 
     Packets are kept in memory (about 125 per second), so each test can slice
     out the packets that belong to one run and write them next to it.
+
+    With DOBOT_RAW_FEED set to a file path, every packet is also appended to
+    it as received: an 8-byte little-endian double (this computer's monotonic
+    time, as in the other files), then the 1440 bytes (see read_raw_feed).
     """
 
     def __init__(self, ip, port=RT_PORT, keep=True, timeout=1.0):
@@ -127,6 +134,8 @@ class RealtimeReader(threading.Thread):
         self.unframed = 0
         self.error = None
         self._stop_evt = threading.Event()
+        raw = os.environ.get('DOBOT_RAW_FEED')
+        self._raw = open(raw, 'ab') if raw else None
 
     def _recv_exact(self, view):
         got = 0
@@ -146,6 +155,8 @@ class RealtimeReader(threading.Thread):
                 except socket.timeout:
                     raise ConnectionError('no realtime data for %.1f s' % self.sock.gettimeout())
                 t = now()
+                if self._raw:
+                    self._raw.write(struct.pack('<d', t) + bytes(buf))
                 pkt = decode_packet(buf)
                 if not packet_is_framed(pkt):
                     # Out of frame: the stream can't be trusted from here on.
@@ -161,6 +172,8 @@ class RealtimeReader(threading.Thread):
             if not self._stop_evt.is_set():
                 self.error = e
         finally:
+            if self._raw:
+                self._raw.close()
             try:
                 self.sock.close()
             except OSError:
@@ -209,6 +222,49 @@ def write_realtime_csv(path, packets):
             w.writerow(realtime_row(t, pkt))
 
 
+def read_raw_feed(path):
+    """[(host_t, raw 1440 bytes)] from a DOBOT_RAW_FEED file; decode_packet()
+    decodes one."""
+    rec = 8 + PACKET_SIZE
+    with open(path, 'rb') as f:
+        data = f.read()
+    return [(struct.unpack_from('<d', data, i)[0], data[i + 8:i + rec])
+            for i in range(0, len(data) - rec + 1, rec)]
+
+
+class ControllerLog(threading.Thread):
+    """Appends the controller's text log (port 65511) to `path` as it arrives.
+    `path`.idx gets one line per received chunk: this computer's monotonic
+    time and the chunk's byte offset in `path`, to line the log up with the
+    other files."""
+
+    def __init__(self, ip, path, port=CTRL_LOG_PORT):
+        super().__init__(daemon=True)
+        self.sock = socket.create_connection((ip, port), timeout=3.0)
+        self.sock.settimeout(1.0)
+        self.out = open(path, 'ab')
+        self.idx = open(path + '.idx', 'a')
+        self.offset = self.out.tell()
+        self.error = None
+
+    def run(self):
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    raise ConnectionError('controller log port closed the connection')
+                self.idx.write('%.4f %d\n' % (now(), self.offset))
+                self.out.write(chunk)
+                self.offset += len(chunk)
+                self.out.flush()
+                self.idx.flush()
+        except Exception as e:  # the test carries on without the log
+            self.error = e
+
+
 # ---------------------------------------------------------------------------
 # Command port (29999)
 # ---------------------------------------------------------------------------
@@ -252,8 +308,10 @@ class Dashboard:
     commands, then read the replies. Replies are split on ';' and buffered, so
     two replies arriving in one TCP segment are handled.
 
-    With DOBOT_TRACE set to a file path, every query() is appended to it:
-    send time, round trip, command and reply.
+    With DOBOT_TRACE set to a file path, every command is appended to it
+    with its reply, ServoJ streams included: send time, round trip, command
+    and reply. Replies come back in order (T4), so they are matched to the
+    commands first in, first out.
     """
 
     def __init__(self, ip, port=DASH_PORT, timeout=2.0, nodelay=True):
@@ -265,6 +323,7 @@ class Dashboard:
         self.sock.settimeout(timeout)
         self._buf = b''
         self._buf_t = 0.0
+        self._sent = deque()   # (send time, command) awaiting a reply, for the trace
 
     def close(self):
         try:
@@ -275,6 +334,8 @@ class Dashboard:
     def send(self, cmd):
         t = now()
         self.sock.sendall(cmd.encode())
+        if self._trace:
+            self._sent.append((t, cmd))
         return t
 
     def recv_reply(self):
@@ -287,15 +348,17 @@ class Dashboard:
             self._buf += chunk
             self._buf_t = now()
         raw, _, self._buf = self._buf.partition(b';')
-        return raw.decode(errors='replace') + ';', self._buf_t
+        raw = raw.decode(errors='replace') + ';'
+        if self._trace and self._sent:
+            t_send, cmd = self._sent.popleft()
+            self._trace.write('%.4f %6.1f ms  %s  ->  %s\n' % (
+                t_send, (self._buf_t - t_send) * 1e3, cmd, raw))
+            self._trace.flush()
+        return raw, self._buf_t
 
     def query(self, cmd):
         t_send = self.send(cmd)
         raw, t_recv = self.recv_reply()
-        if self._trace:
-            self._trace.write('%.4f %6.1f ms  %s  ->  %s\n' % (
-                t_send, (t_recv - t_send) * 1e3, cmd, raw))
-            self._trace.flush()
         return Reply(raw, t_send, t_recv)
 
 
@@ -652,6 +715,7 @@ def run_stream(dash, rt, profile, duration, cfg, log=print):
         if state['abort']:
             log('    ABORT: %s' % state['abort'])
         try:
+            result['stop_sent'] = now()
             r = dash.query('Stop()')
             result['stop_reply'] = r.raw
         except Exception as e:
@@ -796,6 +860,10 @@ def write_json(path, obj):
 
 def connect(args, log=print):
     log('connecting to %s (29999 commands, 30004 realtime)...' % args.ip)
+    ctrl_log = os.environ.get('DOBOT_CTRL_LOG')
+    if ctrl_log:
+        ControllerLog(args.ip, ctrl_log).start()
+        log('recording the controller log (port %d) to %s' % (CTRL_LOG_PORT, ctrl_log))
     dash = Dashboard(args.ip)
     rt = RealtimeReader(args.ip)
     rt.start()

@@ -450,6 +450,14 @@ private:
     void stopThreads();
     double goal_tolerance_deg_ = 0.01;     // arrival, for joints the goal leaves at 0
     double goal_time_tolerance_ = 1.0;     // s after the last point, if the goal gives none
+
+    // ServoJ start reference for this controller session (see ServoSession).
+    TrajectoryExecutor::ServoSession servo_session_;
+    // MovJ to the arm's own joints, so that ServoJ starts from the arm; sets
+    // the session primed. Why it failed, or empty.
+    std::string prime();
+    // Until the realtime feed shows `mode`; false on a timeout, an alarm or shutdown.
+    bool waitMode(uint64_t mode, double timeout_s);
 };
 
 #endif // CRROBOTROS2_H

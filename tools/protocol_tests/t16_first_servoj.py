@@ -21,7 +21,12 @@ Write what came before (how long the controller was off, what you did since
 it started) with --note. If it faulted, clear the alarm on the pendant or
 with ClearError and run it again: the second run should be clean.
 
+With --movj, before the pause it sends a MovJ to the arm's own joints and
+waits for it to finish (RUNNING, then ENABLE): Dobot's suggested way to start
+ServoJ from the current position (2026-10-27).
+
     python3 t16_first_servoj.py --note "off 2 h; not enabled, no jog"
+    python3 t16_first_servoj.py --movj --note "power cycle; enabled in the app"
 """
 import os
 import time
@@ -29,6 +34,16 @@ import time
 import dobot_proto as dp
 
 MOVE_DEG = 0.05      # the target moving this far from the commanded position is the fault
+
+
+def wait_mode(rt, mode, timeout):
+    """Until the feed shows `mode`; True if it did within `timeout` s."""
+    deadline = dp.now() + timeout
+    while dp.now() < deadline:
+        if rt.current(max_age=0.5)['robot_mode'] == mode:
+            return True
+        time.sleep(0.005)
+    return False
 
 
 def toward_zero(start, target):
@@ -47,6 +62,8 @@ def main():
     p.add_argument('--after', type=float, default=1.5, help='s of feed kept after the last')
     p.add_argument('--pause', type=float, default=0.5, help='s between ENABLE and the first ServoJ')
     p.add_argument('--note', default='', help='what came before: power-off time, what was done')
+    p.add_argument('--movj', action='store_true',
+                   help='MovJ to the current joints before the pause, and wait for it to finish')
     p.add_argument('--cases', default=os.path.expanduser('~/servoj_first_cases.md'))
     args = p.parse_args()
     s = dp.Session(args.out, 't16_first_servoj', args)
@@ -59,10 +76,11 @@ def main():
         raise SystemExit('the controller is in %s (%s): clear the alarm first'
                          % (dp.mode_name(mode), dash.query('GetErrorID()').raw))
     enable = mode != 5
-    dp.confirm(['', 'Plan: %s, wait %.1f s, then %d ServoJ to the current position, 20 ms '
+    dp.confirm(['', 'Plan: %s, %swait %.1f s, then %d ServoJ to the current position, 20 ms '
                 'apart, t=%g' % ('EnableRobot() (releases the brakes)' if enable
-                                 else 'the arm is already enabled', args.pause, args.count,
-                                 args.servo_t)], args.yes, s.log)
+                                 else 'the arm is already enabled',
+                                 'MovJ to the current joints, ' if args.movj else '',
+                                 args.pause, args.count, args.servo_t)], args.yes, s.log)
     i0 = rt.index()     # the recording covers the enable and the pause
     if enable:
         t_en = dp.now()
@@ -75,6 +93,26 @@ def main():
         s.log('already enabled: no EnableRobot()')
     dp.preflight(dash, rt, s.log)
     s.log('SpeedFactor(100): %s' % dash.query('SpeedFactor(100)').raw)
+    movj = None
+    if args.movj:
+        here = list(rt.current(max_age=0.5)['q_actual'])
+        r = dash.query('MovJ(joint={%s},a=20,v=5)' % ','.join('%.4f' % v for v in here))
+        s.log('MovJ to the current joints: %s' % r.raw)
+        if r.err != 0:
+            raise SystemExit('the MovJ was rejected; nothing streamed')
+        t_movj = dp.now()
+        # The MovJ is queued: wait for RUNNING (a zero-length move may be too
+        # short for the feed to show it), then for ENABLE.
+        ran = wait_mode(rt, 7, 1.0)
+        idle = wait_mode(rt, 5, 10.0)
+        movj = {'reply': r.raw, 'saw_running': ran, 'enable': idle,
+                'done_s': round(dp.now() - t_movj, 2)}
+        s.log('MovJ: %s, %s after %.2f s' % ('RUNNING seen' if ran else 'RUNNING not seen',
+                                             'ENABLE' if idle else 'NOT back in ENABLE',
+                                             movj['done_s']))
+        if not idle:
+            raise SystemExit('the controller did not return to ENABLE after the MovJ; '
+                             'nothing streamed')
     time.sleep(args.pause)
     q = list(rt.current(max_age=0.5)['q_actual'])
 
@@ -104,7 +142,7 @@ def main():
     case = {'time_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime()), 'run_time_s': run_time,
             'result': 'fault' if faulted else 'clean', 'max_target_move_deg': round(worst, 3),
             'mode_after': mode, 'error_ids': err, 'replies': replies, 'note': args.note,
-            'enabled_by_script': enable, 'pause_s': args.pause,
+            'enabled_by_script': enable, 'pause_s': args.pause, 'movj': movj,
             'start_deg': [round(v, 3) for v in q], 'dir': s.dir}
     if faulted:
         t, pk = worst_pkt
@@ -115,10 +153,11 @@ def main():
     dp.write_json(os.path.join(s.dir, 'case.json'), case)
     dp.write_realtime_csv(os.path.join(s.dir, 'realtime.csv'), packets)
     with open(args.cases, 'a') as f:
-        f.write('- %s UTC, controller up %.0f min, %s, %.1f s pause: **%s**, target moved %.3f '
-                'deg, %s, %s%s%s\n' % (
+        f.write('- %s UTC, controller up %.0f min, %s, %s%.1f s pause: **%s**, target moved '
+                '%.3f deg, %s, %s%s%s\n' % (
             case['time_utc'], (run_time or 0) / 60.0,
-            'enabled here' if enable else 'already enabled', args.pause,
+            'enabled here' if enable else 'already enabled',
+            'MovJ to the current joints, ' if args.movj else '', args.pause,
             case['result'], worst, mode, err,
             ('; toward zero %s' % case['toward_zero']) if faulted else '',
             ('; note: %s' % args.note) if args.note else ''))

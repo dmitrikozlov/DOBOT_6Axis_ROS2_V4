@@ -372,6 +372,9 @@ void CRRobotRos2::pubFeedBackInfo()
     while (rclcpp::ok() && !threads_stopped_)
     {
         RealTimeData realTimeData = commander_->getRealData();
+        int64_t age_ms = commander_->realtimeAgeMs();
+        if (age_ms >= 0 && age_ms <= 500)
+            servo_session_.observe(realTimeData.run_time);
         nlohmann::json root;
 
         root["len"] = realTimeData.len;
@@ -730,7 +733,15 @@ bool CRRobotRos2::getToolVectorActual(double *val, int *user, int *tool)
 bool CRRobotRos2::EnableRobot(const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Request> request,
                               const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response)
 {
-    return commander_->callRosService(parseTool::parserenableRobotRequest2String(request), response->res);
+    bool ok = commander_->callRosService(parseTool::parserenableRobotRequest2String(request), response->res);
+    if (ok && response->res == 0)
+    {
+        std::string why = prime();
+        if (!why.empty())
+            RCLCPP_WARN(this->get_logger(), "EnableRobot: ServoJ not primed (%s); the first "
+                        "trajectory primes it", why.c_str());
+    }
+    return ok;
 }
 
 bool CRRobotRos2::DisableRobot(const std::shared_ptr<dobot_msgs_v4::srv::DisableRobot::Request> request,
@@ -1391,6 +1402,16 @@ bool CRRobotRos2::GetCurrentCommandId(const std::shared_ptr<dobot_msgs_v4::srv::
 
 bool CRRobotRos2::ServoJ(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Response> response)
 {
+    if (!servo_session_.primed() && commander_->getRealData().robot_mode == 5)
+    {
+        std::string why = prime();
+        if (!why.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "ServoJ: not sent, ServoJ not primed: %s", why.c_str());
+            response->res = -1;
+            return true;
+        }
+    }
     return commander_->callRosService(parseTool::parserServoJRequest2String(request), response->res);
 }
 
@@ -1406,6 +1427,49 @@ bool CRRobotRos2::ServoP(const std::shared_ptr<dobot_msgs_v4::srv::ServoP::Reque
 // A trajectory's first point may be this far from the arm (deg): MoveIt's
 // allowed_start_tolerance is 0.01 rad.
 static constexpr double kStartToleranceDeg = 0.5;
+
+bool CRRobotRos2::waitMode(uint64_t mode, double timeout_s)
+{
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
+    while (std::chrono::steady_clock::now() < deadline && !threads_stopped_)
+    {
+        int64_t age_ms = commander_->realtimeAgeMs();
+        if (age_ms >= 0 && age_ms <= 500)
+        {
+            uint64_t now_mode = commander_->getRealData().robot_mode;
+            if (now_mode == mode)
+                return true;
+            if (now_mode == 9 || now_mode == 11)
+                return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
+std::string CRRobotRos2::prime()
+{
+    auto mode = [this]() { return std::to_string(commander_->getRealData().robot_mode); };
+    if (!waitMode(5, 10.0))
+        return "the arm is not in ENABLE (robot mode " + mode() + ")";
+    RealTimeData rd = commander_->getRealData();
+    const auto &q = rd.q_actual;
+    char cmd[160];
+    std::snprintf(cmd, sizeof(cmd), "MovJ(joint={%.4f,%.4f,%.4f,%.4f,%.4f,%.4f},a=20,v=5)",
+                  q[0], q[1], q[2], q[3], q[4], q[5]);
+    RCLCPP_INFO(this->get_logger(), "Priming ServoJ for this controller session: %s", cmd);
+    int32_t err = 0;
+    if (!commander_->callRosService(cmd, err) || err != 0)
+        return "the MovJ to the current joints failed (" + std::to_string(err) + ")";
+    // The MovJ is queued: RUNNING, then ENABLE. A zero-length move can be too
+    // short for the feed to show RUNNING.
+    waitMode(7, 1.0);
+    if (!waitMode(5, 10.0))
+        return "the arm did not finish the MovJ (robot mode " + mode() + ")";
+    servo_session_.markPrimed();
+    RCLCPP_INFO(this->get_logger(), "ServoJ primed");
+    return "";
+}
 
 rclcpp_action::GoalResponse CRRobotRos2::handleGoalFJT(
     const rclcpp_action::GoalUUID & /*uuid*/,
@@ -1494,6 +1558,27 @@ void CRRobotRos2::executeTrajectory(
                       "); clear it first");
         return;
     }
+    // The first stream of a controller session (see ServoSession).
+    servo_session_.observe(rd.run_time);
+    if (!servo_session_.primed())
+    {
+        why = prime();
+        if (!why.empty())
+        {
+            abortWith(result->PATH_TOLERANCE_VIOLATED,
+                      "could not prime ServoJ before the first stream: " + why);
+            return;
+        }
+        if (goal_handle->is_canceling())
+        {
+            result->error_code = result->SUCCESSFUL;
+            result->error_string = "Cancelled by client";
+            goal_handle->canceled(result);
+            return;
+        }
+        rd = commander_->getRealData();
+    }
+
     const auto &first = trajectory.points.front().positions;
     double worst = 0.0;
     size_t worst_j = 0;

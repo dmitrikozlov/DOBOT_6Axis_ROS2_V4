@@ -139,6 +139,27 @@ public:
     };
     static constexpr double kSettleS = 0.05;
 
+    // Whether ServoJ streams start from the arm in this controller session.
+    // On the CR5, after a power-on every stream can move each joint toward 0
+    // (alarm 225) until a MovJ has run; one MovJ before the first ServoJ is
+    // enough for the session (Dobot, and bench 2026-10-27).
+    class ServoSession
+    {
+    public:
+        // The controller's run_time from a fresh realtime packet; a drop
+        // means the controller restarted.
+        void observe(uint64_t run_time);
+        // A MovJ has run in this controller session.
+        void markPrimed();
+        bool primed() const;
+
+    private:
+        mutable std::mutex mutex_;
+        bool primed_ = false;
+        bool seen_ = false;
+        uint64_t last_run_time_ = 0;
+    };
+
 private:
     void servoLoop();
     void settle(const std::array<double, 6> &final_target);

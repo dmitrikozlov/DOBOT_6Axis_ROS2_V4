@@ -202,6 +202,27 @@ bool TrajectoryExecutor::ArrivalCheck::update(double t, const std::array<double,
     return t - within_since_ >= kSettleS;
 }
 
+void TrajectoryExecutor::ServoSession::observe(uint64_t run_time)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (seen_ && run_time < last_run_time_)
+        primed_ = false;
+    seen_ = true;
+    last_run_time_ = run_time;
+}
+
+void TrajectoryExecutor::ServoSession::markPrimed()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    primed_ = true;
+}
+
+bool TrajectoryExecutor::ServoSession::primed() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return primed_;
+}
+
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
     double servo_rate, double servo_t,
@@ -519,14 +540,19 @@ void TrajectoryExecutor::servoLoop()
     int late_sends = 0;
     double max_wake_late_ms = 0.0;  // how late the thread woke for a command
     double max_reply_ms = 0.0;      // the controller's slowest ServoJ reply
+    bool final_sent = false;        // the last point has been sent
 
     while (running_)
     {
         // The trajectory point for this command's slot, whenever it is sent.
+        // The first slot at or after the end carries the last point itself.
         double elapsed = static_cast<double>(iteration) * period;
+        bool last = elapsed >= total_duration;
+        if (last)
+            elapsed = total_duration;
 
         // Streamed to the end: wait for the arm to settle on the last point.
-        if (elapsed >= total_duration)
+        if (final_sent)
         {
             std::array<double, 6> final_target;
             {
@@ -649,6 +675,7 @@ void TrajectoryExecutor::servoLoop()
             state_.elapsed = elapsed;
             state_.desired = target;
         }
+        final_sent = last;
 
         iteration++;
         double sent_at = since_start(send_time);

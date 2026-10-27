@@ -76,6 +76,24 @@ python3 analyze.py results/<session>/<run> [--joint 6]
 writes `plot_J6.png`: commanded vs `q_target` vs `q_actual`, commanded step
 speed vs `qd_target` / `qd_actual`, send gaps and reply times, robot mode.
 
+## Recording more
+
+Three environment variables make any script record more, for the whole run,
+all on this computer's monotonic clock:
+
+| Variable | Records |
+|---|---|
+| `DOBOT_TRACE=<file>` | every command on 29999 with its send time, round trip and reply, ServoJ streams included |
+| `DOBOT_RAW_FEED=<file>` | every 30004 packet as received: an 8-byte time, then the 1440 bytes (`dobot_proto.read_raw_feed`) |
+| `DOBOT_CTRL_LOG=<file>` | the controller's own text log from port 65511 (~200 KB/s); `<file>.idx` maps times to byte offsets |
+
+For the first stream after a power-on, with the arm left disabled:
+
+```bash
+DOBOT_TRACE=~/t16.trace DOBOT_RAW_FEED=~/t16.feed DOBOT_CTRL_LOG=~/t16.ctrl.log \
+    python3 t16_first_servoj.py --note "power cycle; not enabled, no jog"
+```
+
 ## Without the arm
 
 `fake_controller.py` serves both ports on localhost with a crude

@@ -22,6 +22,16 @@ import time
 import dobot_proto as dp
 
 
+def fake_fk(q):
+    """Toy kinematics, linear in J1-J3, so InverseKin and the feed's tool
+    pose have something consistent to report."""
+    return [300.0 + 2.0 * q[0], 2.0 * (q[1] - 10.0), 400.0 + 2.0 * (q[2] - 90.0), 180.0, 0.0, 0.0]
+
+
+def fake_ik(xyz, near):
+    return [(xyz[0] - 300.0) / 2.0, xyz[1] / 2.0 + 10.0, (xyz[2] - 400.0) / 2.0 + 90.0] + list(near[3:])
+
+
 class Robot:
     def __init__(self, reject_speed):
         self.lock = threading.Lock()
@@ -34,6 +44,7 @@ class Robot:
         self.speed = 1.0
         self.reject_speed = reject_speed
         self.error = False
+        self.started = time.monotonic()   # run_time counts from here, as from a boot
 
     def step(self, dt):
         with self.lock:
@@ -57,7 +68,10 @@ class Robot:
             if name == 'GetAngle':
                 return '0,{%s},GetAngle();' % ','.join('%.4f' % v for v in self.q)
             if name == 'GetPose':
-                return '0,{300.0,0.0,400.0,180.0,0.0,0.0},GetPose();'
+                return '0,{%s},GetPose();' % ','.join('%.4f' % v for v in fake_fk(self.q))
+            if name == 'InverseKin':
+                v = [float(a) for a in re.findall(r'-?\d+(?:\.\d+)?', cmd)]
+                return '0,{%s},%s;' % (','.join('%.4f' % a for a in fake_ik(v[:3], v[-6:])), cmd)
             if name == 'Stop':
                 if self.mode == 7:
                     self.mode = 5
@@ -71,6 +85,14 @@ class Robot:
             if name == 'EnableRobot':
                 self.mode = 5
                 return '0,{},EnableRobot();'
+            if name == 'MovJ':
+                # RUNNING briefly, then ENABLE (step() ends it after 0.2 s)
+                self.mode = 7
+                self.last_servo = time.monotonic()
+                return '0,{1},%s;' % cmd
+            if name == 'DisableRobot':
+                self.mode = 4
+                return '0,{},DisableRobot();'
             if name == 'SpeedFactor':
                 self.speed = float(re.findall(r'[\d.]+', cmd)[0]) / 100.0
                 return '0,{},SpeedFactor(%s);' % cmd.split('(', 1)[1].rstrip(')')
@@ -97,6 +119,7 @@ class Robot:
             struct.pack_into('<H', buf, 0, dp.PACKET_SIZE)
             struct.pack_into('<Q', buf, 24, self.mode)
             struct.pack_into('<Q', buf, 32, now_ms)
+            struct.pack_into('<Q', buf, 40, int(time.monotonic() - self.started))
             struct.pack_into('<Q', buf, 48, dp.TEST_VALUE)
             struct.pack_into('<d', buf, 64, self.speed)
             struct.pack_into('<b', buf, 1029, 1 if self.error else 0)
@@ -104,6 +127,8 @@ class Robot:
             struct.pack_into('<6d', buf, 240, *self.qd)
             struct.pack_into('<6d', buf, 432, *self.q)
             struct.pack_into('<6d', buf, 480, *self.qd)
+            struct.pack_into('<6d', buf, 624, *fake_fk(self.q))
+            struct.pack_into('<6d', buf, 768, *fake_fk(self.q_target))
         return bytes(buf)
 
 
