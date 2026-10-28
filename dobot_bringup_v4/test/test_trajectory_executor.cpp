@@ -555,38 +555,3 @@ TEST(TrajectoryExecutorStartFault, OneJointAgainstTheCommands)
     EXPECT_NE(what.find("0.26 deg outside"), std::string::npos) << what;
 }
 
-// ---------------------------------------------------------------------------
-// ServoSession
-// ---------------------------------------------------------------------------
-
-TEST(TrajectoryExecutorServoSession, NotPrimedAtStart)
-{
-    TrajectoryExecutor::ServoSession session;
-    EXPECT_FALSE(session.primed());
-    session.observe(250);
-    EXPECT_FALSE(session.primed());
-}
-
-TEST(TrajectoryExecutorServoSession, PrimedUntilTheControllerRestarts)
-{
-    TrajectoryExecutor::ServoSession session;
-    session.observe(250);
-    session.markPrimed();
-    EXPECT_TRUE(session.primed());
-    session.observe(251);
-    session.observe(4000);
-    EXPECT_TRUE(session.primed());
-    session.observe(40);          // run_time went down: a new controller session
-    EXPECT_FALSE(session.primed());
-    session.observe(41);
-    EXPECT_FALSE(session.primed());
-}
-
-TEST(TrajectoryExecutorServoSession, SameRunTimeIsNoRestart)
-{
-    TrajectoryExecutor::ServoSession session;
-    session.observe(250);
-    session.markPrimed();
-    session.observe(250);
-    EXPECT_TRUE(session.primed());
-}

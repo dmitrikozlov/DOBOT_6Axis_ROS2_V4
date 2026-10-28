@@ -372,9 +372,6 @@ void CRRobotRos2::pubFeedBackInfo()
     while (rclcpp::ok() && !threads_stopped_)
     {
         RealTimeData realTimeData = commander_->getRealData();
-        int64_t age_ms = commander_->realtimeAgeMs();
-        if (age_ms >= 0 && age_ms <= 500)
-            servo_session_.observe(realTimeData.run_time);
         nlohmann::json root;
 
         root["len"] = realTimeData.len;
@@ -733,15 +730,7 @@ bool CRRobotRos2::getToolVectorActual(double *val, int *user, int *tool)
 bool CRRobotRos2::EnableRobot(const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Request> request,
                               const std::shared_ptr<dobot_msgs_v4::srv::EnableRobot::Response> response)
 {
-    bool ok = commander_->callRosService(parseTool::parserenableRobotRequest2String(request), response->res);
-    if (ok && response->res == 0)
-    {
-        std::string why = prime();
-        if (!why.empty())
-            RCLCPP_WARN(this->get_logger(), "EnableRobot: ServoJ not primed (%s); the first "
-                        "trajectory primes it", why.c_str());
-    }
-    return ok;
+    return commander_->callRosService(parseTool::parserenableRobotRequest2String(request), response->res);
 }
 
 bool CRRobotRos2::DisableRobot(const std::shared_ptr<dobot_msgs_v4::srv::DisableRobot::Request> request,
@@ -1402,12 +1391,13 @@ bool CRRobotRos2::GetCurrentCommandId(const std::shared_ptr<dobot_msgs_v4::srv::
 
 bool CRRobotRos2::ServoJ(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Response> response)
 {
-    if (!servo_session_.primed() && commander_->getRealData().robot_mode == 5)
+    // An idle controller means this ServoJ starts a new segment (see prime()).
+    if (commander_->getRealData().robot_mode == 5)
     {
         std::string why = prime();
         if (!why.empty())
         {
-            RCLCPP_ERROR(this->get_logger(), "ServoJ: not sent, ServoJ not primed: %s", why.c_str());
+            RCLCPP_ERROR(this->get_logger(), "ServoJ: not sent: %s", why.c_str());
             response->res = -1;
             return true;
         }
@@ -1447,6 +1437,10 @@ bool CRRobotRos2::waitMode(uint64_t mode, double timeout_s)
     return false;
 }
 
+// Dobot: every ServoJ segment starts with a MovJ to the current position, and
+// the ServoJ follow as soon as its reply arrives (they queue behind it; no wait
+// on the feed). Without it a stream can move every joint toward 0 (alarm 225):
+// after a power-on, a Stop() or an interrupted stream (bench, 2026-10-27).
 std::string CRRobotRos2::prime()
 {
     auto mode = [this]() { return std::to_string(commander_->getRealData().robot_mode); };
@@ -1457,17 +1451,10 @@ std::string CRRobotRos2::prime()
     char cmd[160];
     std::snprintf(cmd, sizeof(cmd), "MovJ(joint={%.4f,%.4f,%.4f,%.4f,%.4f,%.4f},a=20,v=5)",
                   q[0], q[1], q[2], q[3], q[4], q[5]);
-    RCLCPP_INFO(this->get_logger(), "Priming ServoJ for this controller session: %s", cmd);
+    RCLCPP_INFO(this->get_logger(), "New ServoJ segment: %s", cmd);
     int32_t err = 0;
     if (!commander_->callRosService(cmd, err) || err != 0)
         return "the MovJ to the current joints failed (" + std::to_string(err) + ")";
-    // The MovJ is queued: RUNNING, then ENABLE. A zero-length move can be too
-    // short for the feed to show RUNNING.
-    waitMode(7, 1.0);
-    if (!waitMode(5, 10.0))
-        return "the arm did not finish the MovJ (robot mode " + mode() + ")";
-    servo_session_.markPrimed();
-    RCLCPP_INFO(this->get_logger(), "ServoJ primed");
     return "";
 }
 
@@ -1558,27 +1545,6 @@ void CRRobotRos2::executeTrajectory(
                       "); clear it first");
         return;
     }
-    // The first stream of a controller session (see ServoSession).
-    servo_session_.observe(rd.run_time);
-    if (!servo_session_.primed())
-    {
-        why = prime();
-        if (!why.empty())
-        {
-            abortWith(result->PATH_TOLERANCE_VIOLATED,
-                      "could not prime ServoJ before the first stream: " + why);
-            return;
-        }
-        if (goal_handle->is_canceling())
-        {
-            result->error_code = result->SUCCESSFUL;
-            result->error_string = "Cancelled by client";
-            goal_handle->canceled(result);
-            return;
-        }
-        rd = commander_->getRealData();
-    }
-
     const auto &first = trajectory.points.front().positions;
     double worst = 0.0;
     size_t worst_j = 0;
@@ -1627,9 +1593,17 @@ void CRRobotRos2::executeTrajectory(
                 trajectory.points.back().time_from_start.sec +
                     trajectory.points.back().time_from_start.nanosec / 1e9);
 
-    // Load and start.
+    // Every stream is a new ServoJ segment (see prime()).
+    why = prime();
+    if (!why.empty())
+    {
+        abortWith(result->PATH_TOLERANCE_VIOLATED, "could not start the stream: " + why);
+        return;
+    }
+
+    // Load and start, right behind the MovJ.
     trajectory_executor_->loadTrajectory(trajectory, tolerance);
-    trajectory_executor_->start();
+    trajectory_executor_->start(true);
 
     // Monitor loop: publish feedback, check cancellation.
     rclcpp::Rate feedback_rate(20.0);  // 20 Hz feedback

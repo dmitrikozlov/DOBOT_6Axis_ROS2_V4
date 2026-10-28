@@ -23,7 +23,9 @@ with ClearError and run it again: the second run should be clean.
 
 With --movj, before the pause it sends a MovJ to the arm's own joints and
 waits for it to finish (RUNNING, then ENABLE): Dobot's suggested way to start
-ServoJ from the current position (2026-10-27).
+ServoJ from the current position (2026-10-27). With --movj-nowait it sends
+the MovJ and starts the ServoJ stream as soon as the MovJ's reply arrives, with
+no pause and no wait on the feed, as Dobot describes normal use.
 
     python3 t16_first_servoj.py --note "off 2 h; not enabled, no jog"
     python3 t16_first_servoj.py --movj --note "power cycle; enabled in the app"
@@ -64,8 +66,14 @@ def main():
     p.add_argument('--note', default='', help='what came before: power-off time, what was done')
     p.add_argument('--movj', action='store_true',
                    help='MovJ to the current joints before the pause, and wait for it to finish')
+    p.add_argument('--movj-nowait', action='store_true',
+                   help='MovJ to the current joints, then stream as soon as its reply arrives')
     p.add_argument('--cases', default=os.path.expanduser('~/servoj_first_cases.md'))
     args = p.parse_args()
+    if args.movj and args.movj_nowait:
+        raise SystemExit('--movj and --movj-nowait are alternatives')
+    if args.movj and args.movj_nowait:
+        raise SystemExit('--movj and --movj-nowait are alternatives')
     s = dp.Session(args.out, 't16_first_servoj', args)
     dash, rt = dp.connect(args, s.log)
     pkt = rt.current(max_age=0.5)
@@ -76,11 +84,14 @@ def main():
         raise SystemExit('the controller is in %s (%s): clear the alarm first'
                          % (dp.mode_name(mode), dash.query('GetErrorID()').raw))
     enable = mode != 5
-    dp.confirm(['', 'Plan: %s, %swait %.1f s, then %d ServoJ to the current position, 20 ms '
-                'apart, t=%g' % ('EnableRobot() (releases the brakes)' if enable
-                                 else 'the arm is already enabled',
-                                 'MovJ to the current joints, ' if args.movj else '',
-                                 args.pause, args.count, args.servo_t)], args.yes, s.log)
+    dp.confirm(['', 'Plan: %s, %s, then %d ServoJ to the current position, 20 ms apart, '
+                't=%g' % ('EnableRobot() (releases the brakes)' if enable
+                          else 'the arm is already enabled',
+                          'MovJ to the current joints, no wait after its reply'
+                          if args.movj_nowait else
+                          ('MovJ to the current joints, ' if args.movj else '')
+                          + 'wait %.1f s' % args.pause,
+                          args.count, args.servo_t)], args.yes, s.log)
     i0 = rt.index()     # the recording covers the enable and the pause
     if enable:
         t_en = dp.now()
@@ -113,8 +124,16 @@ def main():
         if not idle:
             raise SystemExit('the controller did not return to ENABLE after the MovJ; '
                              'nothing streamed')
-    time.sleep(args.pause)
-    q = list(rt.current(max_age=0.5)['q_actual'])
+    if args.movj_nowait:
+        q = list(rt.current(max_age=0.5)['q_actual'])
+        r = dash.query('MovJ(joint={%s},a=20,v=5)' % ','.join('%.4f' % v for v in q))
+        s.log('MovJ to the current joints: %s; streaming at once' % r.raw)
+        movj = {'reply': r.raw, 'nowait': True}
+        if r.err != 0:
+            raise SystemExit('the MovJ was rejected; nothing streamed')
+    else:
+        time.sleep(args.pause)
+        q = list(rt.current(max_age=0.5)['q_actual'])
 
     replies = []
     t0 = dp.now()
@@ -157,7 +176,8 @@ def main():
                 '%.3f deg, %s, %s%s%s\n' % (
             case['time_utc'], (run_time or 0) / 60.0,
             'enabled here' if enable else 'already enabled',
-            'MovJ to the current joints, ' if args.movj else '', args.pause,
+            'MovJ to the current joints then ServoJ at once, ' if args.movj_nowait
+            else 'MovJ to the current joints, ' if args.movj else '', args.pause,
             case['result'], worst, mode, err,
             ('; toward zero %s' % case['toward_zero']) if faulted else '',
             ('; note: %s' % args.note) if args.note else ''))

@@ -202,27 +202,6 @@ bool TrajectoryExecutor::ArrivalCheck::update(double t, const std::array<double,
     return t - within_since_ >= kSettleS;
 }
 
-void TrajectoryExecutor::ServoSession::observe(uint64_t run_time)
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (seen_ && run_time < last_run_time_)
-        primed_ = false;
-    seen_ = true;
-    last_run_time_ = run_time;
-}
-
-void TrajectoryExecutor::ServoSession::markPrimed()
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    primed_ = true;
-}
-
-bool TrajectoryExecutor::ServoSession::primed() const
-{
-    std::lock_guard<std::mutex> lock(mutex_);
-    return primed_;
-}
-
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
     double servo_rate, double servo_t,
@@ -282,10 +261,11 @@ void TrajectoryExecutor::loadTrajectory(
     }
 }
 
-void TrajectoryExecutor::start()
+void TrajectoryExecutor::start(bool behind_movj)
 {
     if (running_)
         return;
+    behind_movj_ = behind_movj;
 
     // Join a previously completed thread before creating a new one.
     // Without this, assigning to thread_ destroys the old joinable
@@ -441,7 +421,7 @@ void TrajectoryExecutor::servoLoop()
         {
             RealTimeData rd = commander_->getRealData();
             mode = rd.robot_mode;
-            if (mode == 5)
+            if (mode == 5 || (behind_movj_ && mode == 7))
                 break;
             if (mode == 9 || mode == 11)
             {

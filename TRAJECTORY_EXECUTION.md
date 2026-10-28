@@ -83,15 +83,14 @@ MoveIt (plan_only)
    The controller need not be in ENABLE yet: after a stream it stays RUNNING for ~1.7 s, and
    the executor waits up to 10 s for ENABLE before the first ServoJ.
 
-   ServoJ is primed once per controller session: a `MovJ` to the arm's own joints, then a wait
-   for RUNNING and ENABLE (~0.7 s). After a power-on, a ServoJ stream can move every joint
-   toward 0° (alarm 225) until a MovJ has run; Dobot's advice is one MovJ before the first
-   ServoJ, and it held on 3 of 3 power-ons (bench, 2026-10-27). The driver primes after every
-   successful `EnableRobot` service call, and before a goal or a `ServoJ` service call when the
-   session is not primed and the arm is enabled. A drop in the feed's `run_time` (a controller
-   restart) ends the session. If priming fails before a goal, the goal aborts
-   (`PATH_TOLERANCE_VIOLATED`, "could not prime ServoJ before the first stream: …") with nothing
-   streamed.
+   Every stream is a new ServoJ segment and starts with a `MovJ` to the arm's own joints, sent
+   once the goal has passed its checks and the controller is in ENABLE; the stream starts as
+   soon as the MovJ's reply arrives (ServoJ queues behind it). Dobot: a MovJ comes before every
+   ServoJ segment, including after a `Stop()` or an interrupted stream, with no wait on the feed.
+   Without it a stream moved every joint toward 0° (alarm 225) after a power-on, and ran ahead
+   of the commands after a mid-move `Stop()` (bench, 2026-10-27). If the MovJ fails the goal
+   aborts (`PATH_TOLERANCE_VIOLATED`, "could not start the stream: …") with nothing streamed.
+   The `ServoJ` service sends the same MovJ before a ServoJ that finds the controller idle.
 
 3. `TrajectoryExecutor::loadTrajectory()` converts radians to degrees and stores the waypoints.
 4. `servoLoop()` runs in a dedicated thread:
