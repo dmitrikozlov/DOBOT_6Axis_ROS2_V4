@@ -72,6 +72,19 @@ public:
     // the last point has been sent, only the wait for arrival is abandoned.
     void stop();
 
+    // Decelerate along the path to a standstill and end the stream, without
+    // Stop(): the trajectory's time slows so that the tool decelerates at the
+    // halt deceleration, then the arm settles on the last command. Before the
+    // stream starts it ends with nothing sent; while waiting for arrival, the
+    // wait ends. Returns at once; the stream ends with State::halted.
+    void halt();
+    void setHaltDecel(double mm_s2) { halt_decel_mm_s2_ = mm_s2; }
+
+    // How much the trajectory's time rate (1 = as planned) falls per period in
+    // a halt from tool_speed (mm/s) at decel (mm/s^2): to 0 over
+    // tool_speed / decel, and over no less than one period.
+    static double haltRateStep(double tool_speed_mm_s, double decel_mm_s2, double period);
+
     bool isRunning() const;
 
     struct State
@@ -86,6 +99,7 @@ public:
         bool done = false;
         std::string error_msg;            // non-empty on failure
         bool goal_tolerance_violated = false;  // streamed, but did not arrive
+        bool halted = false;              // ended by halt()
     };
 
     State getState() const;
@@ -143,7 +157,7 @@ public:
 
 private:
     void servoLoop();
-    void settle(const std::array<double, 6> &final_target);
+    void settle(const std::array<double, 6> &final_target, bool halted = false);
     void fail(const std::string &msg);
     std::array<double, 6> interpolate(double t) const;  // caller must hold mutex_
 
@@ -152,6 +166,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> settling_{false};  // streamed; waiting for the arm to arrive
     bool behind_movj_ = false;           // start(): stream at once behind a MovJ
+    std::atomic<bool> halt_requested_{false};
+    double halt_decel_mm_s2_ = 2000.0;   // tool deceleration of a halt
     mutable std::mutex mutex_;  // guards trajectory data and state_
 
     // Trajectory data — stored in degrees (Dobot convention)

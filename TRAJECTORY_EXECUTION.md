@@ -40,7 +40,7 @@ MoveIt (plan_only)
 │                                                  │
 │  FollowJointTrajectory action server             │
 │    ├─ handleGoalFJT()    → accept                │
-│    ├─ handleCancelFJT()  → stop executor         │
+│    ├─ handleCancelFJT()  → halt executor         │
 │    └─ executeTrajectory() (own thread, joined)    │
 │         checks the goal, one at a time            │
 │         │                                        │
@@ -54,6 +54,7 @@ MoveIt (plan_only)
 │    │    ├─ sendServoCommand() → dashboard TCP    │
 │    │    └─ drift-compensated sleep               │
 │    ├─ settle()          wait for arrival         │
+│    ├─ halt()            slow to rest on the path │
 │    └─ stop()            send Stop(), join thread │
 │                                                  │
 │  Existing services (MovJ, MovL, etc.)            │
@@ -118,10 +119,14 @@ MoveIt (plan_only)
    velocities in radians; `time_from_start` the trajectory time of the latest command). It reports
    success only once the arm has arrived; `GOAL_TOLERANCE_VIOLATED` if it does not arrive in
    time; `PATH_TOLERANCE_VIOLATED` for an alarm, a rejected ServoJ or a stale feed during the
-   stream. A cancel during the stream sends `Stop()` and reports `CANCELED`. A cancel while
-   waiting for arrival sends nothing: `Stop()` on a servo session whose arm has arrived,
-   followed by a MovL and then a MovJ, made the next stream drive J1 the wrong way (alarms
-   225/227) on the bench.
+   stream. A cancel during the stream halts along the path: the trajectory's time slows so
+   that the tool decelerates at `halt_decel_mm_s2` (from the feed's `tcp_speed_target` at the
+   cancel, over no less than one period), the stream ends at rest on its last command, the
+   arm settles on it, and the goal reports `CANCELED` ("halted"). No `Stop()` is sent; the
+   next stream starts with its own MovJ. A cancel before the stream starts ends it with nothing
+   sent, and a cancel while waiting for arrival ends the wait. On the bench a halt at
+   2000 mm/s² stopped the tool ~2.4 mm past the cancel at 40 mm/s, where `Stop()` took ~6 mm
+   (t23, 2026-10-27). `Stop()` stays for aborts: a stale feed, a shutdown.
 
 ## Thread Safety
 
@@ -150,6 +155,7 @@ Added to the `dobot_bringup_ros2` node:
 | `servo_rt_priority` | 80 | SCHED_FIFO priority of the servo thread; 0 keeps normal scheduling |
 | `goal_tolerance_deg` | 0.01 | Arrival tolerance (°) for every joint the goal's `goal_tolerance` leaves at 0. A negative goal tolerance leaves that joint unchecked |
 | `goal_time_tolerance` | 1.0 | Time (s) after the last point to arrive in, when the goal's `goal_time_tolerance` is 0 |
+| `halt_decel_mm_s2` | 2000.0 | Tool deceleration (mm/s²) of the halt a cancel starts during a stream |
 
 ## Action Server Interface
 

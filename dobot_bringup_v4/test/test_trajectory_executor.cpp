@@ -555,3 +555,24 @@ TEST(TrajectoryExecutorStartFault, OneJointAgainstTheCommands)
     EXPECT_NE(what.find("0.26 deg outside"), std::string::npos) << what;
 }
 
+
+// ---------------------------------------------------------------------------
+// Halt
+// ---------------------------------------------------------------------------
+
+TEST(TrajectoryExecutorHalt, RateFallsOverSpeedOverDecel)
+{
+    // 60 mm/s at 2000 mm/s^2: 30 ms to a standstill, 2/3 of the rate per 20 ms.
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(60.0, 2000.0, 0.02), 2.0 / 3.0, kTol);
+    // 100 mm/s at 500 mm/s^2: 200 ms, a tenth per period.
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(100.0, 500.0, 0.02), 0.1, kTol);
+}
+
+TEST(TrajectoryExecutorHalt, NoFasterThanOnePeriod)
+{
+    // 40 mm/s at 2000 mm/s^2 is exactly one period; slower stops take one too.
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(40.0, 2000.0, 0.02), 1.0, kTol);
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(5.0, 2000.0, 0.02), 1.0, kTol);
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(0.0, 2000.0, 0.02), 1.0, kTol);
+    EXPECT_NEAR(TrajectoryExecutor::haltRateStep(40.0, 0.0, 0.02), 1.0, kTol);
+}

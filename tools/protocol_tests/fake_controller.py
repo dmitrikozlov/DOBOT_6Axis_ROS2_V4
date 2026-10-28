@@ -129,6 +129,8 @@ class Robot:
             struct.pack_into('<6d', buf, 480, *self.qd)
             struct.pack_into('<6d', buf, 624, *fake_fk(self.q))
             struct.pack_into('<6d', buf, 768, *fake_fk(self.q_target))
+            # tcp_speed_target, mm/s: the toy kinematics' 2 mm per degree
+            struct.pack_into('<6d', buf, 816, *([2.0 * v for v in self.qd[:3]] + [0.0] * 3))
         return bytes(buf)
 
 

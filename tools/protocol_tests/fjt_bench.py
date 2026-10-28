@@ -86,7 +86,7 @@ class Bench(Node):
 
 def main():
     class A:
-        ip = dp.DEFAULT_IP
+        ip = os.environ.get('DOBOT_IP', dp.DEFAULT_IP)   # e.g. 127.0.0.1 for fake_controller.py
     rt = dp.RealtimeReader(A.ip)
     rt.start()
     rt.wait_first()

@@ -266,6 +266,7 @@ void TrajectoryExecutor::start(bool behind_movj)
     if (running_)
         return;
     behind_movj_ = behind_movj;
+    halt_requested_ = false;
 
     // Join a previously completed thread before creating a new one.
     // Without this, assigning to thread_ destroys the old joinable
@@ -283,6 +284,7 @@ void TrajectoryExecutor::start(bool behind_movj)
         state_.done = false;
         state_.error_msg.clear();
         state_.goal_tolerance_violated = false;
+        state_.halted = false;
         state_.elapsed = 0.0;
     }
 
@@ -310,6 +312,23 @@ void TrajectoryExecutor::stop()
         int32_t err_id = 0;
         commander_->sendServoCommand("Stop()", err_id);
     }
+}
+
+double TrajectoryExecutor::haltRateStep(double tool_speed_mm_s, double decel_mm_s2, double period)
+{
+    double stop_s = decel_mm_s2 > 0.0 ? tool_speed_mm_s / decel_mm_s2 : 0.0;
+    return period / std::max(stop_s, period);
+}
+
+void TrajectoryExecutor::halt()
+{
+    // Only the first call acts: once a halt is under way, its settle wait is
+    // what tells that the arm has stopped.
+    if (!running_ || halt_requested_.exchange(true))
+        return;
+    // Streamed to the end: the arm is settling and there is nothing to slow.
+    if (settling_)
+        running_ = false;
 }
 
 bool TrajectoryExecutor::isRunning() const
@@ -407,6 +426,15 @@ void TrajectoryExecutor::servoLoop()
     auto wait_start = std::chrono::steady_clock::now();
     while (running_)
     {
+        if (halt_requested_)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_.done = true;
+            state_.halted = true;
+            running_ = false;
+            RCLCPP_INFO(kLogger, "Halted before the stream started: nothing sent");
+            return;
+        }
         // robot_mode comes off the realtime feed (TCP 30004), not the
         // dashboard. When that feed stalls the struct keeps whatever it last
         // held, so "the robot will not enable" and "we have no idea what the
@@ -520,27 +548,65 @@ void TrajectoryExecutor::servoLoop()
     int late_sends = 0;
     double max_wake_late_ms = 0.0;  // how late the thread woke for a command
     double max_reply_ms = 0.0;      // the controller's slowest ServoJ reply
-    bool final_sent = false;        // the last point has been sent
+    bool final_sent = false;        // the last point (or a halt's) has been sent
+    double sent_elapsed = 0.0;      // trajectory time of the latest command
+    bool halting = false;
+    double rate = 1.0;              // trajectory time per wall time; falls in a halt
+    double rate_step = 0.0;
+    double halt_t = 0.0;
 
     while (running_)
     {
         // The trajectory point for this command's slot, whenever it is sent.
         // The first slot at or after the end carries the last point itself.
         double elapsed = static_cast<double>(iteration) * period;
+        if (!halting && !final_sent && halt_requested_)
+        {
+            if (iteration == 0)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                state_.done = true;
+                state_.halted = true;
+                RCLCPP_INFO(kLogger, "Halted before the first ServoJ: nothing sent");
+                break;
+            }
+            double tool = linearSpeed(commander_->getRealData().TCP_speed_target);
+            rate_step = haltRateStep(tool, halt_decel_mm_s2_, period);
+            halting = true;
+            halt_t = sent_elapsed;
+            RCLCPP_INFO(kLogger, "Halting at %.2f s of %.2f s: tool %.0f mm/s, to a standstill "
+                        "in %.0f ms at %.0f mm/s^2", sent_elapsed, total_duration, tool,
+                        period / rate_step * 1e3, halt_decel_mm_s2_);
+        }
+        // In a halt the trajectory's time slows to a stop along the same path
+        // (the average of the rate over the period: a linear deceleration).
+        if (halting)
+        {
+            double before = rate;
+            rate = std::max(0.0, rate - rate_step);
+            halt_t += 0.5 * (before + rate) * period;
+            elapsed = halt_t;
+        }
         bool last = elapsed >= total_duration;
         if (last)
             elapsed = total_duration;
+        bool halt_end = halting && rate <= 0.0;
 
-        // Streamed to the end: wait for the arm to settle on the last point.
+        // Streamed to the end, or halted: wait for the arm to settle on the
+        // last command.
         if (final_sent)
         {
             std::array<double, 6> final_target;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                final_target = joints_deg_.back();
-                state_.elapsed = total_duration;
-                state_.desired = final_target;
+                final_target = halting ? state_.desired : joints_deg_.back();
+                if (!halting)
+                {
+                    state_.elapsed = total_duration;
+                    state_.desired = final_target;
+                }
                 state_.desired_vel = {};
+                state_.halted = halting;
             }
             RCLCPP_INFO(kLogger, "Trajectory streamed: %.2f s (planned %.2f s), longest gap "
                         "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
@@ -548,7 +614,7 @@ void TrajectoryExecutor::servoLoop()
                         since_start(std::chrono::steady_clock::now()), total_duration,
                         max_gap_ms, 1000.0 / servo_rate_, late_sends, max_wake_late_ms,
                         max_reply_ms);
-            settle(final_target);
+            settle(final_target, halting);
             break;
         }
 
@@ -655,7 +721,8 @@ void TrajectoryExecutor::servoLoop()
             state_.elapsed = elapsed;
             state_.desired = target;
         }
-        final_sent = last;
+        sent_elapsed = elapsed;
+        final_sent = last || halt_end;
 
         iteration++;
         double sent_at = since_start(send_time);
@@ -670,7 +737,7 @@ void TrajectoryExecutor::servoLoop()
     running_ = false;
 }
 
-void TrajectoryExecutor::settle(const std::array<double, 6> &final_target)
+void TrajectoryExecutor::settle(const std::array<double, 6> &final_target, bool halted)
 {
     GoalTolerance tolerance;
     {
@@ -718,8 +785,17 @@ void TrajectoryExecutor::settle(const std::array<double, 6> &final_target)
         {
             std::lock_guard<std::mutex> lock(mutex_);
             state_.done = true;
-            RCLCPP_INFO(kLogger, "Arrived %.0f ms after the last point: offset %s deg",
-                        t * 1e3, joints(offset).c_str());
+            RCLCPP_INFO(kLogger, "Arrived %.0f ms after the last %s: offset %s deg",
+                        t * 1e3, halted ? "command of the halt" : "point", joints(offset).c_str());
+            return;
+        }
+        // A halt has no goal to reach: the arm stops where it stops.
+        if (halted && t > tolerance.time_s)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state_.done = true;
+            RCLCPP_INFO(kLogger, "Halted; %.2f s after the last command the arm is %s deg from it",
+                        t, joints(offset).c_str());
             return;
         }
         if (t > tolerance.time_s)

@@ -5,6 +5,7 @@
 #include <rclcpp/clock.hpp>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <iostream>
 #include <string>
 #include <stdio.h>
@@ -46,7 +47,8 @@ int main(int argc, char *argv[])
 
   robot->init();
 
-  rclcpp::Rate rate(rate_value);
+  const auto publish_period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(1.0 / rate_value));
   double position[6];
   // A gap in the tool pose longer than 2.5 publish periods is logged: the arm camera's TF
   // comes from it, so frames captured in the gap cannot be placed. The log
@@ -60,6 +62,7 @@ int main(int argc, char *argv[])
   auto ms = [](Clock::duration d) {
     return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
   };
+  auto next_publish = Clock::now();
   while (rclcpp::ok())
   {
     // Joint states only from fresh realtime data: without it nothing is
@@ -105,10 +108,18 @@ int main(int argc, char *argv[])
     robot_status_msg.is_enable = robot->isEnable();
     robot_status_msg.is_connected = robot->isConnected();
     robot_status_pub->publish(robot_status_msg);
-    auto spin_start = Clock::now();
-    rclcpp::spin_some(robot);
-    longest_spin = std::max(longest_spin, Clock::now() - spin_start);
-    rate.sleep();
+    // The node's callbacks (services, trajectory goals and cancels) are served
+    // every 2 ms until the next publish: a cancel has to reach the halt at once.
+    next_publish += publish_period;
+    if (Clock::now() > next_publish + publish_period)
+      next_publish = Clock::now();  // a long callback: no burst of publishes after it
+    do
+    {
+      auto spin_start = Clock::now();
+      rclcpp::spin_some(robot);
+      longest_spin = std::max(longest_spin, Clock::now() - spin_start);
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    } while (rclcpp::ok() && Clock::now() < next_publish);
   }
 
   // 关闭 ROS 2 环境
