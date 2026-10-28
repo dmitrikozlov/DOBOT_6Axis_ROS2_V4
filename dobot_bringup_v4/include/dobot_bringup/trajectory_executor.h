@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -79,6 +80,22 @@ public:
     // wait ends. Returns at once; the stream ends with State::halted.
     void halt();
     void setHaltDecel(double mm_s2) { halt_decel_mm_s2_ = mm_s2; }
+
+    // After the last point (or a halt's last command) the stream keeps
+    // sending it every period: through the wait for arrival, then for hold_s
+    // after arrival, so that a following trajectory can continue the same
+    // ServoJ segment without a MovJ. Ends at once if hold_s is 0.
+    void setHold(double s) { hold_s_ = s; }
+    // Continue the segment with traj (its first point at the held point) from
+    // the next period. False if the stream is not holding: the next
+    // trajectory then needs a new segment.
+    bool append(const trajectory_msgs::msg::JointTrajectory &traj,
+                const GoalTolerance &tolerance);
+    bool isHolding() const { return holding_; }
+    // The point being held (deg), valid while isHolding().
+    std::array<double, 6> heldPoint() const;
+    // Stop holding: the stream ends without Stop(), the arm being at rest.
+    void endHold();
 
     // How much the trajectory's time rate (1 = as planned) falls per period in
     // a halt from tool_speed (mm/s) at decel (mm/s^2): to 0 over
@@ -157,14 +174,20 @@ public:
 
 private:
     void servoLoop();
-    void settle(const std::array<double, 6> &final_target, bool halted = false);
     void fail(const std::string &msg);
     std::array<double, 6> interpolate(double t) const;  // caller must hold mutex_
 
     std::shared_ptr<CRCommanderRos2> commander_;
     std::thread thread_;
     std::atomic<bool> running_{false};
-    std::atomic<bool> settling_{false};  // streamed; waiting for the arm to arrive
+    std::atomic<bool> settling_{false};  // streamed: arrival wait or hold
+    std::atomic<bool> holding_{false};   // arrived; a trajectory may be appended
+    double hold_s_ = 1.0;
+    // A trajectory append() passed to the stream; guarded by mutex_.
+    bool pending_ = false;
+    std::vector<double> pending_times_;
+    std::vector<std::array<double, 6>> pending_joints_;
+    GoalTolerance pending_tol_;
     bool behind_movj_ = false;           // start(): stream at once behind a MovJ
     std::atomic<bool> halt_requested_{false};
     double halt_decel_mm_s2_ = 2000.0;   // tool deceleration of a halt

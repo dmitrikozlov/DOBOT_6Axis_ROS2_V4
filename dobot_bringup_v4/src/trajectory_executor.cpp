@@ -225,6 +225,22 @@ TrajectoryExecutor::~TrajectoryExecutor()
     stop();
 }
 
+// Point times (s) and joint positions (deg) of traj.
+static void toDegrees(const trajectory_msgs::msg::JointTrajectory &traj,
+                      std::vector<double> &times, std::vector<std::array<double, 6>> &joints)
+{
+    times.clear();
+    joints.clear();
+    for (const auto &pt : traj.points)
+    {
+        times.push_back(pt.time_from_start.sec + pt.time_from_start.nanosec / 1e9);
+        std::array<double, 6> q{};
+        for (size_t i = 0; i < 6 && i < pt.positions.size(); i++)
+            q[i] = TrajectoryExecutor::rad2Deg(pt.positions[i]);
+        joints.push_back(q);
+    }
+}
+
 void TrajectoryExecutor::loadTrajectory(const trajectory_msgs::msg::JointTrajectory &traj)
 {
     loadTrajectory(traj, GoalTolerance{});
@@ -238,21 +254,7 @@ void TrajectoryExecutor::loadTrajectory(
 
     std::lock_guard<std::mutex> lock(mutex_);
     tolerance_ = tolerance;
-    timestamps_.clear();
-    joints_deg_.clear();
-
-    for (const auto &pt : traj.points)
-    {
-        double t = pt.time_from_start.sec + pt.time_from_start.nanosec / 1e9;
-        timestamps_.push_back(t);
-
-        std::array<double, 6> joints{};
-        for (size_t i = 0; i < 6 && i < pt.positions.size(); i++)
-        {
-            joints[i] = rad2Deg(pt.positions[i]);
-        }
-        joints_deg_.push_back(joints);
-    }
+    toDegrees(traj, timestamps_, joints_deg_);
 
     state_ = State{};
     if (!timestamps_.empty())
@@ -329,6 +331,39 @@ void TrajectoryExecutor::halt()
     // Streamed to the end: the arm is settling and there is nothing to slow.
     if (settling_)
         running_ = false;
+}
+
+bool TrajectoryExecutor::append(const trajectory_msgs::msg::JointTrajectory &traj,
+                                const GoalTolerance &tolerance)
+{
+    if (traj.points.empty())
+        return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Under the mutex: the stream ends its hold only under it too.
+    if (!holding_ || !running_)
+        return false;
+    toDegrees(traj, pending_times_, pending_joints_);
+    pending_tol_ = tolerance;
+    pending_ = true;
+    halt_requested_ = false;
+    // The goal that called this watches state_ from now on.
+    std::array<double, 6> held = state_.desired;
+    state_ = State{};
+    state_.total_duration = pending_times_.back();
+    state_.desired = held;
+    return true;
+}
+
+std::array<double, 6> TrajectoryExecutor::heldPoint() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return state_.desired;
+}
+
+void TrajectoryExecutor::endHold()
+{
+    if (holding_)
+        stop();      // settling: no Stop(), only the end of the stream
 }
 
 bool TrajectoryExecutor::isRunning() const
@@ -541,6 +576,7 @@ void TrajectoryExecutor::servoLoop()
     }
 
     uint64_t iteration = 0;
+    uint64_t base = 0;              // iteration at which the current trajectory began
     std::deque<SentServo> recent;
     auto last_send = start_time;
     double max_gap_ms = 0.0;
@@ -554,12 +590,47 @@ void TrajectoryExecutor::servoLoop()
     double rate = 1.0;              // trajectory time per wall time; falls in a halt
     double rate_step = 0.0;
     double halt_t = 0.0;
+    bool watch_start = true;        // the start-of-stream check: the segment's first trajectory
+    // After the last command: arrival on it, then the hold window.
+    std::array<double, 6> held{};
+    double held_since = 0.0;        // s from the start, when it was sent
+    double arrived_at = -1.0;       // s from the start; < 0 before arrival
+    std::optional<ArrivalCheck> arrival;
+    GoalTolerance tolerance;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tolerance = tolerance_;
+    }
 
     while (running_)
     {
+        // A trajectory appended during the hold continues the segment from
+        // this period: same rhythm, no MovJ.
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (final_sent && pending_)
+            {
+                timestamps_ = std::move(pending_times_);
+                joints_deg_ = std::move(pending_joints_);
+                tolerance = tolerance_ = pending_tol_;
+                pending_ = false;
+                holding_ = false;
+                settling_ = false;
+                total_duration = timestamps_.back();
+                base = iteration;
+                final_sent = false;
+                halting = false;
+                rate = 1.0;
+                arrived_at = -1.0;
+                watch_start = false;
+                RCLCPP_INFO(kLogger, "Appended a %.2f s trajectory: the segment continues",
+                            total_duration);
+            }
+        }
+
         // The trajectory point for this command's slot, whenever it is sent.
         // The first slot at or after the end carries the last point itself.
-        double elapsed = static_cast<double>(iteration) * period;
+        double elapsed = static_cast<double>(iteration - base) * period;
         if (!halting && !final_sent && halt_requested_)
         {
             if (iteration == 0)
@@ -580,7 +651,7 @@ void TrajectoryExecutor::servoLoop()
         }
         // In a halt the trajectory's time slows to a stop along the same path
         // (the average of the rate over the period: a linear deceleration).
-        if (halting)
+        if (halting && !final_sent)
         {
             double before = rate;
             rate = std::max(0.0, rate - rate_step);
@@ -592,34 +663,13 @@ void TrajectoryExecutor::servoLoop()
             elapsed = total_duration;
         bool halt_end = halting && rate <= 0.0;
 
-        // Streamed to the end, or halted: wait for the arm to settle on the
-        // last command.
+        // Streamed to the end, or halted: the last command again, every period.
+        std::array<double, 6> target;
         if (final_sent)
         {
-            std::array<double, 6> final_target;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                final_target = halting ? state_.desired : joints_deg_.back();
-                if (!halting)
-                {
-                    state_.elapsed = total_duration;
-                    state_.desired = final_target;
-                }
-                state_.desired_vel = {};
-                state_.halted = halting;
-            }
-            RCLCPP_INFO(kLogger, "Trajectory streamed: %.2f s (planned %.2f s), longest gap "
-                        "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
-                        "than 1 ms late; latest wake-up %.1f ms, slowest reply %.1f ms",
-                        since_start(std::chrono::steady_clock::now()), total_duration,
-                        max_gap_ms, 1000.0 / servo_rate_, late_sends, max_wake_late_ms,
-                        max_reply_ms);
-            settle(final_target, halting);
-            break;
+            target = held;
         }
-
-        // Interpolate target joints at current time.
-        std::array<double, 6> target;
+        else
         {
             std::lock_guard<std::mutex> lock(mutex_);
             target = interpolate(elapsed);
@@ -641,7 +691,7 @@ void TrajectoryExecutor::servoLoop()
         // Check robot mode from real-time data.
         RealTimeData real_data = commander_->getRealData();
         uint64_t mode = real_data.robot_mode;
-        std::string fault = start_fault(elapsed, real_data);
+        std::string fault = watch_start && !final_sent ? start_fault(elapsed, real_data) : "";
         if (mode == 9 || mode == 11)
         {
             fail("Robot entered error mode " + std::to_string(mode) +
@@ -661,6 +711,65 @@ void TrajectoryExecutor::servoLoop()
         {
             lo[j] = std::min(lo[j], target[j]);
             hi[j] = std::max(hi[j], target[j]);
+        }
+
+        // Holding: arrival on the last command, the arrival limit, the hold window.
+        if (final_sent)
+        {
+            double t = since_start(std::chrono::steady_clock::now()) - held_since;
+            std::array<double, 6> offset{};
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (size_t j = 0; j < 6; j++)
+                {
+                    offset[j] = real_data.q_actual[j] - held[j];
+                    state_.actual[j] = real_data.q_actual[j];
+                    state_.actual_vel[j] = real_data.qd_actual[j];
+                    state_.error[j] = -offset[j];
+                }
+            }
+            if (arrived_at < 0.0)
+            {
+                bool now_arrived = arrival->update(t, offset);
+                // A halt has no goal to reach: the arm stops where it stops.
+                if (!now_arrived && t > tolerance.time_s && !halting)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        state_.goal_tolerance_violated = true;
+                    }
+                    char limit[32];
+                    std::snprintf(limit, sizeof(limit), "%.2f", tolerance.time_s);
+                    fail("The arm did not settle within " + joints(tolerance.position_deg) +
+                         " deg of the last point in " + limit + " s: offset " + joints(offset) +
+                         " deg");
+                    break;
+                }
+                if (now_arrived || t > tolerance.time_s)
+                {
+                    arrived_at = since_start(std::chrono::steady_clock::now());
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    state_.done = true;
+                    holding_ = hold_s_ > 0.0;
+                    RCLCPP_INFO(kLogger, "%s %.0f ms after the last %s: offset %s deg%s",
+                                now_arrived ? "Arrived" : "Halted, still settling",
+                                t * 1e3, halting ? "command of the halt" : "point",
+                                joints(offset).c_str(),
+                                holding_ ? "; holding it for a following trajectory" : "");
+                }
+            }
+            if (arrived_at >= 0.0 &&
+                since_start(std::chrono::steady_clock::now()) - arrived_at >= hold_s_)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!pending_)
+                {
+                    if (holding_)
+                        RCLCPP_INFO(kLogger, "Hold ended: no following trajectory");
+                    holding_ = false;
+                    break;
+                }
+            }
         }
 
         // Format and send ServoJ command.
@@ -701,28 +810,48 @@ void TrajectoryExecutor::servoLoop()
         {
             // A rejection at the start is how the fault usually shows; the
             // feed tells which.
-            std::string why = start_fault(elapsed, commander_->getRealData());
+            std::string why = watch_start ? start_fault(elapsed, commander_->getRealData()) : "";
             fail("ServoJ failed: err_id=" + std::to_string(err_id) +
                  (why.empty() ? "" : "; " + why));
             logRecentSends(recent, servo_t_);
             break;
         }
 
-        // Update state.
+        if (!final_sent)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (size_t i = 0; i < 6; i++)
             {
-                state_.desired_vel[i] = iteration > 0 ? (target[i] - state_.desired[i]) / period : 0.0;
-                state_.actual[i] = real_data.q_actual[i];
-                state_.actual_vel[i] = real_data.qd_actual[i];
-                state_.error[i] = target[i] - real_data.q_actual[i];
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (size_t i = 0; i < 6; i++)
+                {
+                    state_.desired_vel[i] = iteration > base ? (target[i] - state_.desired[i]) / period : 0.0;
+                    state_.actual[i] = real_data.q_actual[i];
+                    state_.actual_vel[i] = real_data.qd_actual[i];
+                    state_.error[i] = target[i] - real_data.q_actual[i];
+                }
+                state_.elapsed = elapsed;
+                state_.desired = target;
             }
-            state_.elapsed = elapsed;
-            state_.desired = target;
+            sent_elapsed = elapsed;
+            if (last || halt_end)
+            {
+                final_sent = true;
+                held = target;
+                held_since = since_start(send_time);
+                arrival.emplace(tolerance.position_deg);
+                settling_ = true;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    state_.desired_vel = {};
+                    state_.halted = halting;
+                }
+                RCLCPP_INFO(kLogger, "Trajectory %s: %.2f s (planned %.2f s), longest gap "
+                            "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
+                            "than 1 ms late; latest wake-up %.1f ms, slowest reply %.1f ms",
+                            halting ? "halted" : "streamed",
+                            since_start(send_time), total_duration, max_gap_ms,
+                            1000.0 / servo_rate_, late_sends, max_wake_late_ms, max_reply_ms);
+            }
         }
-        sent_elapsed = elapsed;
-        final_sent = last || halt_end;
 
         iteration++;
         double sent_at = since_start(send_time);
@@ -734,82 +863,7 @@ void TrajectoryExecutor::servoLoop()
                              std::chrono::duration<double>(due)));
     }
 
+    holding_ = false;
+    settling_ = false;
     running_ = false;
-}
-
-void TrajectoryExecutor::settle(const std::array<double, 6> &final_target, bool halted)
-{
-    GoalTolerance tolerance;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tolerance = tolerance_;
-    }
-    ArrivalCheck arrival(tolerance.position_deg);
-    settling_ = true;
-    struct Settled
-    {
-        std::atomic<bool> &flag;
-        ~Settled() { flag = false; }
-    } settled{settling_};
-    auto start = std::chrono::steady_clock::now();
-    std::array<double, 6> offset{};
-    while (running_)
-    {
-        double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        int64_t age_ms = commander_->realtimeAgeMs();
-        if (age_ms < 0 || age_ms > kStreamStaleMs)
-        {
-            fail("Realtime feedback stale (" + std::to_string(age_ms) +
-                 " ms since the last packet) while the arm settled; arrival unknown. "
-                 "Check the TCP 30004 link");
-            return;
-        }
-        RealTimeData rd = commander_->getRealData();
-        if (rd.robot_mode == 9 || rd.robot_mode == 11)
-        {
-            fail("Robot entered error mode " + std::to_string(rd.robot_mode) +
-                 " while settling on the last point");
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            for (size_t j = 0; j < 6; j++)
-            {
-                offset[j] = rd.q_actual[j] - final_target[j];
-                state_.actual[j] = rd.q_actual[j];
-                state_.actual_vel[j] = rd.qd_actual[j];
-                state_.error[j] = -offset[j];
-            }
-        }
-        if (arrival.update(t, offset))
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.done = true;
-            RCLCPP_INFO(kLogger, "Arrived %.0f ms after the last %s: offset %s deg",
-                        t * 1e3, halted ? "command of the halt" : "point", joints(offset).c_str());
-            return;
-        }
-        // A halt has no goal to reach: the arm stops where it stops.
-        if (halted && t > tolerance.time_s)
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            state_.done = true;
-            RCLCPP_INFO(kLogger, "Halted; %.2f s after the last command the arm is %s deg from it",
-                        t, joints(offset).c_str());
-            return;
-        }
-        if (t > tolerance.time_s)
-        {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                state_.goal_tolerance_violated = true;
-            }
-            char limit[32];
-            std::snprintf(limit, sizeof(limit), "%.2f", tolerance.time_s);
-            fail("The arm did not settle within " + joints(tolerance.position_deg) +
-                 " deg of the last point in " + limit + " s: offset " + joints(offset) + " deg");
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(4));
-    }
 }

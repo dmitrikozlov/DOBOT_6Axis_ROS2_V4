@@ -53,7 +53,8 @@ MoveIt (plan_only)
 │    │    ├─ check robot_mode from real-time data  │
 │    │    ├─ sendServoCommand() → dashboard TCP    │
 │    │    └─ drift-compensated sleep               │
-│    ├─ settle()          wait for arrival         │
+│    ├─ hold              arrival, then hold_s     │
+│    ├─ append()          continue the segment     │
 │    ├─ halt()            slow to rest on the path │
 │    └─ stop()            send Stop(), join thread │
 │                                                  │
@@ -111,10 +112,18 @@ MoveIt (plan_only)
      driver stops sending and aborts with what the target did, how far into the stream and
      the controller's uptime, and logs the last commands. It sends no `Stop()` and does not
      retry: the alarm and the `ClearError` after it are what reset the controller.
-5. After the last point nothing more is sent: no repeat of the final point, no `Stop()` (which
-   halts the arm ~0.1° short). `settle()` waits for every joint to stay within its goal
-   tolerance of the last point for 50 ms. The bench arm arrives 0.2–0.6 s after the last point;
-   the controller's own target overshoots by ~0.075° and creeps back (t18, 2026-10-22).
+5. After the last point the stream holds it: the same ServoJ every period, no `Stop()` (which
+   halts the arm ~0.1° short). The goal succeeds once every joint has stayed within its goal
+   tolerance of the last point for 50 ms; the bench arm arrives 0.2–0.6 s after the last point,
+   the controller's own target overshooting by ~0.075° and creeping back (t18, 2026-10-22; t18
+   also showed a held final point arrives as well as one sent once). The hold goes on for
+   `hold_s` after arrival. A goal accepted meanwhile whose first point is within 0.5° of the
+   held point continues the same ServoJ segment from the next period: no MovJ, the command
+   rhythm unbroken (Dobot: a ServoJ while the controller is RUNNING continues its segment only
+   if the interval stays the same). Otherwise the hold ends, the controller's servo mode runs
+   out (~1.7 s), and the next goal starts a new segment with its MovJ. A MovJ, MovL or Stop
+   service call ends the hold first: the controller would otherwise keep a MovJ or MovL back
+   until the servo mode ends. A halt is held the same way, so a retract can follow it at once.
 6. The action server publishes feedback at 20 Hz (stamped; desired/actual/error positions and
    velocities in radians; `time_from_start` the trajectory time of the latest command). It reports
    success only once the arm has arrived; `GOAL_TOLERANCE_VIOLATED` if it does not arrive in
@@ -156,6 +165,7 @@ Added to the `dobot_bringup_ros2` node:
 | `goal_tolerance_deg` | 0.01 | Arrival tolerance (°) for every joint the goal's `goal_tolerance` leaves at 0. A negative goal tolerance leaves that joint unchecked |
 | `goal_time_tolerance` | 1.0 | Time (s) after the last point to arrive in, when the goal's `goal_time_tolerance` is 0 |
 | `halt_decel_mm_s2` | 2000.0 | Tool deceleration (mm/s²) of the halt a cancel starts during a stream |
+| `hold_s` | 1.0 | How long (s) the stream holds a goal's last point after arrival, so a goal starting there continues the segment; 0: no hold |
 
 ## Action Server Interface
 

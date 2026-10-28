@@ -136,6 +136,21 @@ def main():
           f'{b.q()[J1] - q[J1]:+.2f} deg of -10  [{"ok" if ok else "EXPECTED CANCELED"}]')
     results.append(ok)
 
+    # A goal sent the moment the previous one succeeds continues its held
+    # segment: no MovJ, and the controller never returns to ENABLE between them.
+    time.sleep(3.0)                 # the cancelled goal's hold and servo tail end
+    q = b.q()
+    ha = b.send(goal_for(q, J1, 5.0))
+    ca, ma, _ = b.result(ha)
+    i0 = rt.index()
+    hb = b.send(goal_for(b.q(), J1, -5.0))
+    cb, mb, _ = b.result(hb)
+    modes = {p['robot_mode'] for _, p in rt.slice(i0)}
+    ok = ca == 'SUCCESSFUL' and cb == 'SUCCESSFUL' and 5 not in modes
+    print(f'goal straight after a goal: first {ca}, second {cb}; modes between them '
+          f'{sorted(modes)}  [{"ok" if ok else "EXPECTED SUCCESSFUL twice, never ENABLE(5)"}]')
+    results.append(ok)
+
     # Too short an arrival limit: streamed, but GOAL_TOLERANCE_VIOLATED.
     time.sleep(1.0)
     # It also takes the arm back to where the bench started.

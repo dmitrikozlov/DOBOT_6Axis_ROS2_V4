@@ -343,6 +343,11 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     this->declare_parameter("halt_decel_mm_s2", 2000.0);
     double haltDecel = this->get_parameter("halt_decel_mm_s2").as_double();
     trajectory_executor_->setHaltDecel(haltDecel);
+    // After a goal's last point the stream holds it this long after arrival,
+    // so a goal that starts there continues the same ServoJ segment.
+    this->declare_parameter("hold_s", 1.0);
+    double holdS = this->get_parameter("hold_s").as_double();
+    trajectory_executor_->setHold(holdS);
 
     std::string fjtActionName =
         "/" + robotType + "_group_controller/follow_joint_trajectory";
@@ -361,10 +366,10 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     RCLCPP_INFO(this->get_logger(),
                 "FollowJointTrajectory action server ready at %s "
                 "(rate=%.0f Hz, t=%.4f, ahead=%.1f, gain=%.1f; arrival within %.3f deg, %.2f s; "
-                "halt at %.0f mm/s^2)",
+                "halt at %.0f mm/s^2; hold %.1f s)",
                 fjtActionName.c_str(),
                 servoRate, servoT, servoAheadtime, servoGain,
-                goal_tolerance_deg_, goal_time_tolerance_, haltDecel);
+                goal_tolerance_deg_, goal_time_tolerance_, haltDecel, holdS);
 }
 
 void CRRobotRos2::pubFeedBackInfo()
@@ -845,6 +850,7 @@ bool CRRobotRos2::RunScript(const std::shared_ptr<dobot_msgs_v4::srv::RunScript:
 
 bool CRRobotRos2::Stop(const std::shared_ptr<dobot_msgs_v4::srv::Stop::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::Stop::Response> response)
 {
+    trajectory_executor_->endHold();
     return commander_->callRosService(parseTool::parserstopRequest2String(request), response->res);
 }
 
@@ -1319,11 +1325,15 @@ bool CRRobotRos2::SetOutputFloat(const std::shared_ptr<dobot_msgs_v4::srv::SetOu
 
 bool CRRobotRos2::MovJ(const std::shared_ptr<dobot_msgs_v4::srv::MovJ::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::MovJ::Response> response)
 {
+    // A held ServoJ segment would keep the controller in servo mode, and the
+    // controller holds a MovJ or MovL back until that ends.
+    trajectory_executor_->endHold();
     return commander_->callRosService_f(parseTool::parsermovJRequest2String(request), response->res,response->robot_return);
 }
 
 bool CRRobotRos2::MovL(const std::shared_ptr<dobot_msgs_v4::srv::MovL::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::MovL::Response> response)
 {
+    trajectory_executor_->endHold();
     return commander_->callRosService_f(parseTool::parsermovLRequest2String(request), response->res,response->robot_return);
 }
 
@@ -1554,12 +1564,21 @@ void CRRobotRos2::executeTrajectory(
                       "); clear it first");
         return;
     }
+    // While the stream holds a previous goal's last point, a trajectory that
+    // starts there continues the segment: its start is checked against it.
+    bool holding = trajectory_executor_->isHolding();
+    std::array<double, 6> from_deg{};
+    if (holding)
+        from_deg = trajectory_executor_->heldPoint();
+    else
+        for (size_t j = 0; j < 6; j++)
+            from_deg[j] = rd.q_actual[j];
     const auto &first = trajectory.points.front().positions;
     double worst = 0.0;
     size_t worst_j = 0;
     for (size_t j = 0; j < 6; j++)
     {
-        double off = std::fabs(TrajectoryExecutor::rad2Deg(first[j]) - rd.q_actual[j]);
+        double off = std::fabs(TrajectoryExecutor::rad2Deg(first[j]) - from_deg[j]);
         if (off > worst)
         {
             worst = off;
@@ -1570,11 +1589,12 @@ void CRRobotRos2::executeTrajectory(
     {
         char buf[160];
         std::snprintf(buf, sizeof(buf),
-                      "the trajectory starts %.2f deg from the arm on %s (start %.3f, arm "
+                      "the trajectory starts %.2f deg from the %s on %s (start %.3f, %s "
                       "%.3f deg; at most %.2f)",
-                      worst, TrajectoryExecutor::kJointNames[worst_j].c_str(),
-                      TrajectoryExecutor::rad2Deg(first[worst_j]), rd.q_actual[worst_j],
-                      kStartToleranceDeg);
+                      worst, holding ? "held point" : "arm",
+                      TrajectoryExecutor::kJointNames[worst_j].c_str(),
+                      TrajectoryExecutor::rad2Deg(first[worst_j]), holding ? "held" : "arm",
+                      from_deg[worst_j], kStartToleranceDeg);
         abortWith(result->INVALID_GOAL, buf);
         return;
     }
@@ -1602,17 +1622,23 @@ void CRRobotRos2::executeTrajectory(
                 trajectory.points.back().time_from_start.sec +
                     trajectory.points.back().time_from_start.nanosec / 1e9);
 
-    // Every stream is a new ServoJ segment (see prime()).
-    why = prime();
-    if (!why.empty())
+    if (holding && trajectory_executor_->append(trajectory, tolerance))
     {
-        abortWith(result->PATH_TOLERANCE_VIOLATED, "could not start the stream: " + why);
-        return;
+        RCLCPP_INFO(this->get_logger(), "FJT: continues the held ServoJ segment");
     }
-
-    // Load and start, right behind the MovJ.
-    trajectory_executor_->loadTrajectory(trajectory, tolerance);
-    trajectory_executor_->start(true);
+    else
+    {
+        // A new ServoJ segment (see prime()).
+        why = prime();
+        if (!why.empty())
+        {
+            abortWith(result->PATH_TOLERANCE_VIOLATED, "could not start the stream: " + why);
+            return;
+        }
+        // Load and start, right behind the MovJ.
+        trajectory_executor_->loadTrajectory(trajectory, tolerance);
+        trajectory_executor_->start(true);
+    }
 
     // Monitor loop: publish feedback; a cancel halts along the path and the
     // feedback goes on until the arm has stopped.
@@ -1620,6 +1646,13 @@ void CRRobotRos2::executeTrajectory(
     bool halting = false;
     while (rclcpp::ok() && trajectory_executor_->isRunning())
     {
+        // The goal is over once the arm has arrived (or the stream failed),
+        // though the stream may go on holding the last point.
+        {
+            auto now_state = trajectory_executor_->getState();
+            if (now_state.done || !now_state.error_msg.empty())
+                break;
+        }
         if (goal_handle->is_canceling() && !halting)
         {
             trajectory_executor_->halt();
