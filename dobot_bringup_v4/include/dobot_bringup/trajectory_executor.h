@@ -37,9 +37,13 @@ public:
         double time_s = 1.0;
     };
 
+    // A ServoJ goes out right after every packets_per_command-th realtime
+    // packet: the controller takes the latest command once per its own cycle,
+    // and commands timed by the Pi's clock drift against it, some landing a
+    // cycle early or late. That made a ~4 % ripple in the arm's speed at a
+    // 20 ms timer, ~1.8 % in step with the feed (t24, 2026-10-29).
     TrajectoryExecutor(std::shared_ptr<CRCommanderRos2> commander,
-                       double servo_rate = 50.0,
-                       double servo_t = 0.02,
+                       int packets_per_command = 3,
                        double aheadtime = 50.0,
                        double gain = 500.0,
                        int rt_priority = 0);
@@ -130,18 +134,6 @@ public:
     static inline double rad2Deg(double rad) { return rad * 180.0 / kPi; }
     static inline double deg2Rad(double deg) { return deg * kPi / 180.0; }
 
-    // When the next ServoJ is due (s from the stream's start), given when the
-    // last one was due and when it was sent: one period later, or one period
-    // after the send if that was more than kLateSend late. Each command
-    // carries the trajectory point for its own slot (index × period), so a
-    // late send delays the rest of the stream instead of being made up. The
-    // next command never follows a late one early: on the CR5, a ServoJ 10 ms
-    // early made the controller's target speed surge 30 % and raised alarm 225.
-    static double nextDue(double due, double sent, double period);
-
-    // How late a send may be and still keep the schedule (s): wake-up jitter.
-    static constexpr double kLateSend = 0.001;
-
     // At a stream's start the controller's target follows the commands, behind
     // them, so it stays within the range of the commands sent so far and its
     // own target before the stream ([lo, hi] per joint, deg). On the CR5 it
@@ -199,8 +191,7 @@ private:
     GoalTolerance tolerance_;
 
     // Configuration
-    double servo_rate_;
-    double servo_t_;
+    int packets_per_command_;
     double aheadtime_;
     double gain_;
     int rt_priority_;               // SCHED_FIFO priority of the servo thread; 0: none

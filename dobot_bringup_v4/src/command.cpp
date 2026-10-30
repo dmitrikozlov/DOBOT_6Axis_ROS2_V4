@@ -1,6 +1,7 @@
 #include <dobot_bringup/command.h>
 #include <rclcpp/rclcpp.hpp>
 #include <chrono>
+#include <cmath>
 #include <thread>
 
 static const rclcpp::Logger kLogger = rclcpp::get_logger("dobot_tcp");
@@ -19,6 +20,8 @@ static constexpr std::chrono::milliseconds kJointStateMaxAge{500};
 // A gap between realtime packets longer than this is logged: the arm's pose
 // (joint states, the tool pose and the TF built from them) stops moving on.
 static constexpr std::chrono::milliseconds kRealtimeGapWarn{100};
+// Packets per window of the feed's period: ~2 s.
+static constexpr uint64_t kPeriodWindowPackets = 250;
 
 CRCommanderRos2::CRCommanderRos2(const std::string &ip)
     : is_running_(false)
@@ -134,8 +137,28 @@ void CRCommanderRos2::recvTask()
                             RCLCPP_WARN(kLogger, "realtime packets: none for %ld ms",
                                         static_cast<long>(std::chrono::duration_cast<
                                             std::chrono::milliseconds>(now - real_time_stamp_).count()));
+                        // A gap in the feed starts a new window for the period.
+                        if (real_time_stamp_.time_since_epoch().count() == 0 ||
+                            now - real_time_stamp_ > std::chrono::milliseconds(50))
+                        {
+                            period_window_start_ = now;
+                            period_window_count_ = packet_count_ + 1;
+                        }
                         *real_time_data_ = packet;
                         real_time_stamp_ = now;
+                        realtime_lag_ms_ = std::llround(feed_lag_.update(
+                            std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(),
+                            packet.controller_timer));
+                        ++packet_count_;
+                        if (packet_count_ - period_window_count_ >= kPeriodWindowPackets)
+                        {
+                            packet_period_s_ =
+                                std::chrono::duration<double>(now - period_window_start_).count() /
+                                static_cast<double>(packet_count_ - period_window_count_);
+                            period_window_start_ = now;
+                            period_window_count_ = packet_count_;
+                        }
+                        packet_cv_.notify_all();
                     }
                 }
                 else if (++realtime_timeouts >= kRealtimeMaxTimeouts)
@@ -174,6 +197,8 @@ void CRCommanderRos2::recvTask()
             try
             {
                 real_time_tcp_->connect();
+                std::lock_guard<std::mutex> lock(mutex_);
+                feed_lag_.reset();
             }
             catch (const TcpClientException &err)
             {
@@ -594,6 +619,26 @@ RealTimeData CRCommanderRos2::getRealData() const
     return *real_time_data_;
 }
 
+uint64_t CRCommanderRos2::realtimePackets() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return packet_count_;
+}
+
+uint64_t CRCommanderRos2::waitRealtimePacket(uint64_t after, std::chrono::milliseconds timeout) const
+{
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!packet_cv_.wait_for(lock, timeout, [&] { return packet_count_ > after; }))
+        return 0;
+    return packet_count_;
+}
+
+double CRCommanderRos2::realtimePeriodS() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return packet_period_s_;
+}
+
 int64_t CRCommanderRos2::realtimeAgeMs() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -601,5 +646,6 @@ int64_t CRCommanderRos2::realtimeAgeMs() const
         return -1;
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now() - real_time_stamp_)
-        .count();
+               .count() +
+           realtime_lag_ms_;
 }

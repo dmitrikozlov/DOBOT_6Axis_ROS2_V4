@@ -150,16 +150,17 @@ def run(node, client, rt, args, v):
     if not handle.accepted:
         return {'speed': v, 'error': 'goal rejected'}
     r = handle.get_result_async()
-    deadline = time.monotonic() + 10.0
+    deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline and not r.done():
         rclpy.spin_once(node, timeout_sec=0.002)
-        if progress['t'] >= t_cancel_traj:
+        if progress['t'] >= t_cancel_traj and not args.no_cancel:
             break
     t_cancel = dp.now()
     wall_cancel = time.time()        # the driver's log uses the same clock
-    c = handle.cancel_goal_async()
-    rclpy.spin_until_future_complete(node, c, timeout_sec=5.0)
-    rclpy.spin_until_future_complete(node, r, timeout_sec=10.0)
+    if not args.no_cancel:
+        c = handle.cancel_goal_async()
+        rclpy.spin_until_future_complete(node, c, timeout_sec=5.0)
+    rclpy.spin_until_future_complete(node, r, timeout_sec=30.0)
     res = r.result()
     time.sleep(0.5)
     packets = rt.slice(i0)
@@ -221,6 +222,8 @@ def main():
     p.add_argument('--sign', type=float, default=1.0, help='1 or -1: J1 direction')
     p.add_argument('--line', default='', help='straight line direction, base frame, e.g. 0,0,1')
     p.add_argument('--max-mm', type=float, default=60.0, help='longest line, mm')
+    p.add_argument('--no-cancel', action='store_true',
+                   help='let each move run to its end (for its smoothness, not a halt)')
     p.add_argument('--yes', action='store_true')
     args = p.parse_args()
     speeds = [float(v) for v in args.speeds.split(',')]

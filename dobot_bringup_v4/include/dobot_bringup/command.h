@@ -17,6 +17,8 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <algorithm>
+#include <condition_variable>
 #include <chrono>
 #include <algorithm>
 #include <regex>
@@ -36,7 +38,7 @@ typedef struct RealTimeData_t
     uint64_t digital_outputs;    // 0016 ~ 0023  DO 按照bit 进行计算的
     uint64_t robot_mode;         // 0024 ~ 0031  机器人模式
     uint64_t controller_timer;   // 0032 ~ 0039  机器人时间 1970年到现在的时间  单位是 ms
-    uint64_t run_time;           // 0040 ~ 0047  机器人开机时间 单位是ms
+    uint64_t run_time;           // 0040 ~ 0047  机器人开机时间 单位是ms (seconds on the CR5, fw 4.6)
     // 0048 ~ 0095                       //
     uint64_t test_value;         // 0048 ~ 0055  内存结构测试标准值  0x0123 4567 89AB CDEF
     double safety_mode;          // 0056 ~ 0063  (弃用字段)
@@ -121,6 +123,39 @@ typedef struct RealTimeData_t
 } RealTimeData;
 #pragma pack(pop)
 
+// How late realtime packets are read, from the controller's clock stamp
+// (controller_timer, ms). A packet read as soon as it is sent has the smallest
+// arrival-minus-stamp offset; packets queued in the socket have a larger one.
+// The smallest offset seen is the reference. It may rise by kDrift per ms of
+// arrival time, so the two clocks drifting apart is not read as lag. The
+// controller's clock going back, or reset(), starts again.
+class FeedLag
+{
+public:
+    static constexpr double kDrift = 1e-4;  // 100 ppm: above a quartz clock's drift
+
+    // The lag (ms) of a packet stamped stamp_ms that arrived at arrival_ms.
+    double update(double arrival_ms, uint64_t stamp_ms)
+    {
+        double offset = arrival_ms - static_cast<double>(stamp_ms);
+        if (!valid_ || stamp_ms < last_stamp_)
+            base_ms_ = offset;
+        else
+            base_ms_ = std::min(offset, base_ms_ + kDrift * (arrival_ms - last_arrival_ms_));
+        valid_ = true;
+        last_arrival_ms_ = arrival_ms;
+        last_stamp_ = stamp_ms;
+        return offset - base_ms_;
+    }
+    void reset() { valid_ = false; }
+
+private:
+    bool valid_ = false;
+    double base_ms_ = 0.0;
+    double last_arrival_ms_ = 0.0;
+    uint64_t last_stamp_ = 0;
+};
+
 class CRCommanderRos2
 {
 protected:
@@ -130,6 +165,16 @@ private:
     mutable std::mutex mutex_;
     std::shared_ptr<RealTimeData> real_time_data_;
     std::chrono::steady_clock::time_point real_time_stamp_{};
+    // Guarded by mutex_: valid packets so far, and their period (s): the time
+    // over the packets of a ~2 s window, which packets read in pairs do not bias.
+    mutable std::condition_variable packet_cv_;
+    uint64_t packet_count_ = 0;
+    double packet_period_s_ = 0.0082;
+    std::chrono::steady_clock::time_point period_window_start_{};
+    uint64_t period_window_count_ = 0;
+    // Guarded by mutex_: how late the latest packet was read (ms).
+    FeedLag feed_lag_;
+    int64_t realtime_lag_ms_ = 0;
     std::atomic<bool> is_running_;
     std::unique_ptr<std::thread> thread_;
     std::shared_ptr<TcpClient> real_time_tcp_;
@@ -162,11 +207,22 @@ public:
     uint64_t getRobotMode() const;
     RealTimeData getRealData() const;
 
-    // Milliseconds since the last VALID realtime packet, or -1 if none has ever
-    // arrived. Anything reading getRealData() must check this: the struct keeps
-    // its last contents across a link drop, so a feed that has stopped updating
-    // is indistinguishable from a robot that is merely sitting still.
+    // How old the latest VALID realtime packet's data is (ms): the time since it
+    // arrived plus how late it was read (packets queued in the socket, by the
+    // controller's clock), or -1 if none has ever arrived. Anything reading
+    // getRealData() must check this: the struct keeps its last contents across
+    // a link drop, so a feed that has stopped updating is indistinguishable from
+    // a robot that is merely sitting still.
     int64_t realtimeAgeMs() const;
+
+    // Valid realtime packets received so far. The controller sends one per
+    // control cycle, so their arrival is the controller's clock.
+    uint64_t realtimePackets() const;
+    // Waits until more than `after` packets have arrived, at most timeout:
+    // the count then, or 0 on a timeout.
+    uint64_t waitRealtimePacket(uint64_t after, std::chrono::milliseconds timeout) const;
+    // The feed's period (s), averaged over recent packets (~8.2 ms on the CR5).
+    double realtimePeriodS() const;
 
     // Thread-safe, low-overhead command send for servo streaming.
     // Uses dash_mutex_ to serialise with callRosService calls.

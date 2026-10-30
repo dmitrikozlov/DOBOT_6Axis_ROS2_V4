@@ -7,7 +7,7 @@ A possible workaround — planning in MoveIt with `plan_only=True` then sending 
 
 ## Solution
 
-A C++ `TrajectoryExecutor` class added directly to the `dobot_bringup_v4` node. It streams ServoJ commands over the dashboard TCP at a fixed rate, following the MoveIt-planned path faithfully.
+A C++ `TrajectoryExecutor` class added directly to the `dobot_bringup_v4` node. It streams ServoJ commands over the dashboard TCP in step with the controller's cycle, following the MoveIt-planned path faithfully.
 
 ## What Changed
 
@@ -52,7 +52,7 @@ MoveIt (plan_only)
 │    │    ├─ interpolate(t) → target joints (deg)  │
 │    │    ├─ check robot_mode from real-time data  │
 │    │    ├─ sendServoCommand() → dashboard TCP    │
-│    │    └─ drift-compensated sleep               │
+│    │    └─ wait for the controller's next cycle  │
 │    ├─ hold              arrival, then hold_s     │
 │    ├─ append()          continue the segment     │
 │    ├─ halt()            slow to rest on the path │
@@ -96,14 +96,21 @@ MoveIt (plan_only)
 
 3. `TrajectoryExecutor::loadTrajectory()` converts radians to degrees and stores the waypoints.
 4. `servoLoop()` runs in a dedicated thread:
-   - Reads wall-clock elapsed time since start.
-   - Linearly interpolates the target joint positions at the current time.
+   - Takes its slot's trajectory time (command index × command period).
+   - Linearly interpolates the target joint positions at that time.
    - Checks robot mode from the 125 Hz real-time feedback channel — aborts on ERROR (9) or COLLISION (11).
    - Formats a `ServoJ(j1,j2,...,j6,t=T,aheadtime=A,gain=G)` command.
    - Sends it via `sendServoCommand()` — direct TCP with minimal overhead, no per-call logging.
-   - Sleeps until `start_time + iteration * period` (drift-compensated).
+   - Waits for the feed packet the next command is due on: one ServoJ right after every
+     `servo_packets_per_command`-th realtime packet (3: ~24.5 ms), with `t` that many feed periods
+     (averaged from the packets' arrival). The controller takes the latest command once per its own
+     ~8.2 ms cycle; commands timed by the Pi's clock (a 20 ms timer before) drift against it and
+     some land a cycle early or late, which made a ~4 % ripple in the arm's speed, varying from run
+     to run. In step with the feed it was ~1.8 % (t24, 2026-10-29). A command held up past its
+     packet (a slow reply) delays the rest of the stream instead of being made up.
    - Sends `Stop()` and aborts when the feed is more than 100 ms old: the arm would be moving
-     unwatched.
+     unwatched. A packet's age is the time since it arrived plus how late it was read, from
+     its `controller_timer` stamp, so packets queued in the socket count as old.
    - For the first 0.5 s, checks that the controller's own target (`q_target`) stays within
      0.05° of the range of the commands sent so far and its target before the stream. On the
      CR5 it sometimes leaves it at once: every joint toward 0° by the same fraction of its
@@ -158,7 +165,7 @@ Added to the `dobot_bringup_ros2` node:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `servo_rate` | 50.0 | ServoJ streaming rate (Hz). The ServoJ time parameter (`t`) is derived as 1/servo_rate. |
+| `servo_packets_per_command` | 3 | A ServoJ right after every this many realtime packets (~8.2 ms each); `t` is that many feed periods |
 | `servo_aheadtime` | 50.0 | Controller lookahead / D-term [20..100] |
 | `servo_gain` | 500.0 | Controller proportional gain [200..1000] |
 | `servo_rt_priority` | 80 | SCHED_FIFO priority of the servo thread; 0 keeps normal scheduling |
@@ -187,7 +194,7 @@ Where `{robot_type}` comes from the `robot_type` parameter (default: `cr5`).
 
 The ServoJ parameters control how the Dobot's internal controller tracks the commanded positions:
 
-- **`servo_t`** — Time interval between commands. Must match `1/servo_rate`. Default 0.02s = 50 Hz.
+- **`servo_packets_per_command`** — Controller cycles per command. 3 (~24.5 ms) leaves room for the controller's slowest ServoJ replies (~16 ms); 2 was as smooth (t24).
 - **`servo_aheadtime`** — Lookahead time (derivative-like). Higher = smoother but more lag. Range: 20–100.
 - **`servo_gain`** — Proportional gain. Higher = stiffer tracking but can oscillate. Range: 200–1000.
 

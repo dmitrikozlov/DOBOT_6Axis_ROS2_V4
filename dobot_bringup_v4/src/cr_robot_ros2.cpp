@@ -317,15 +317,16 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     // ------------------------------------------------------------------
     // Trajectory executor + FollowJointTrajectory action server
     // ------------------------------------------------------------------
-    this->declare_parameter("servo_rate", 50.0);
+    // A ServoJ right after every this many realtime packets (the controller's
+    // ~8.2 ms cycle): 3 is ~24.5 ms, room for the controller's slowest replies.
+    this->declare_parameter("servo_packets_per_command", 3);
     this->declare_parameter("servo_aheadtime", 50.0);
     this->declare_parameter("servo_gain", 500.0);
     // SCHED_FIFO priority of the thread that streams ServoJ (0: normal
     // scheduling). Without the right to it the thread warns and stays normal.
     this->declare_parameter("servo_rt_priority", 80);
 
-    double servoRate = this->get_parameter("servo_rate").as_double();
-    double servoT = 1.0 / servoRate;
+    int servoPackets = static_cast<int>(this->get_parameter("servo_packets_per_command").as_int());
     double servoAheadtime = this->get_parameter("servo_aheadtime").as_double();
     double servoGain = this->get_parameter("servo_gain").as_double();
     int servoRtPriority = static_cast<int>(this->get_parameter("servo_rt_priority").as_int());
@@ -338,7 +339,7 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     goal_time_tolerance_ = this->get_parameter("goal_time_tolerance").as_double();
 
     trajectory_executor_ = std::make_shared<TrajectoryExecutor>(
-        commander_, servoRate, servoT, servoAheadtime, servoGain, servoRtPriority);
+        commander_, servoPackets, servoAheadtime, servoGain, servoRtPriority);
     // A cancel during a stream slows the tool along the path at this rate.
     this->declare_parameter("halt_decel_mm_s2", 2000.0);
     double haltDecel = this->get_parameter("halt_decel_mm_s2").as_double();
@@ -365,10 +366,10 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
     RCLCPP_INFO(this->get_logger(),
                 "FollowJointTrajectory action server ready at %s "
-                "(rate=%.0f Hz, t=%.4f, ahead=%.1f, gain=%.1f; arrival within %.3f deg, %.2f s; "
-                "halt at %.0f mm/s^2; hold %.1f s)",
+                "(a ServoJ every %d feed packets, ahead=%.1f, gain=%.1f; arrival within %.3f deg, "
+                "%.2f s; halt at %.0f mm/s^2; hold %.1f s)",
                 fjtActionName.c_str(),
-                servoRate, servoT, servoAheadtime, servoGain,
+                servoPackets, servoAheadtime, servoGain,
                 goal_tolerance_deg_, goal_time_tolerance_, haltDecel, holdS);
 }
 
@@ -1553,7 +1554,7 @@ void CRRobotRos2::executeTrajectory(
     {
         abortWith(result->PATH_TOLERANCE_VIOLATED,
                   "realtime feedback stale (" + std::to_string(age_ms) +
-                      " ms since the last packet); check the TCP 30004 link");
+                      " ms old); check the TCP 30004 link");
         return;
     }
     RealTimeData rd = commander_->getRealData();

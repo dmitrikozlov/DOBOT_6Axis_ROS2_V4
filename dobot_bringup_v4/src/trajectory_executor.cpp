@@ -204,21 +204,16 @@ bool TrajectoryExecutor::ArrivalCheck::update(double t, const std::array<double,
 
 TrajectoryExecutor::TrajectoryExecutor(
     std::shared_ptr<CRCommanderRos2> commander,
-    double servo_rate, double servo_t,
+    int packets_per_command,
     double aheadtime, double gain, int rt_priority)
     : commander_(commander),
-      servo_rate_(servo_rate),
-      servo_t_(servo_t),
+      packets_per_command_(std::max(1, packets_per_command)),
       aheadtime_(aheadtime),
       gain_(gain),
       rt_priority_(rt_priority)
 {
 }
 
-double TrajectoryExecutor::nextDue(double due, double sent, double period)
-{
-    return (sent - due > kLateSend ? sent : due) + period;
-}
 
 TrajectoryExecutor::~TrajectoryExecutor()
 {
@@ -449,10 +444,13 @@ void TrajectoryExecutor::servoLoop()
                         rt_priority_, std::strerror(err));
     }
 
+    // Each command covers packets_per_command_ controller cycles: its t, and
+    // the trajectory time between commands.
+    const double period = packets_per_command_ * commander_->realtimePeriodS();
     RCLCPP_INFO(kLogger,
-                "Servo loop started: rate=%.1f Hz, t=%.4f s, "
+                "Servo loop started: a ServoJ every %d feed packets (%.2f ms), "
                 "aheadtime=%.1f, gain=%.1f, points=%zu",
-                servo_rate_, servo_t_, aheadtime_, gain_,
+                packets_per_command_, period * 1e3, aheadtime_, gain_,
                 joints_deg_.size());
 
     // Wait for robot to be in ENABLE mode (5) before streaming ServoJ.
@@ -506,7 +504,7 @@ void TrajectoryExecutor::servoLoop()
             state_.error_msg =
                 stale ? "Realtime feedback stale (" +
                             (age_ms < 0 ? std::string("no packet ever received")
-                                        : std::to_string(age_ms) + " ms since the last one") +
+                                        : std::to_string(age_ms) + " ms old") +
                             ") — robot mode unknown; check the TCP 30004 link"
                       : "Timeout waiting for ENABLE mode (current: " +
                             std::to_string(mode) + ")";
@@ -564,7 +562,6 @@ void TrajectoryExecutor::servoLoop()
     };
 
     auto start_time = std::chrono::steady_clock::now();
-    const double period = 1.0 / servo_rate_;
     auto since_start = [&start_time](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double>(t - start_time).count();
     };
@@ -580,9 +577,9 @@ void TrajectoryExecutor::servoLoop()
     std::deque<SentServo> recent;
     auto last_send = start_time;
     double max_gap_ms = 0.0;
-    double due = 0.0;               // when this command was due (s from start)
-    int late_sends = 0;
-    double max_wake_late_ms = 0.0;  // how late the thread woke for a command
+    auto traj_start = start_time;   // when the current trajectory began
+    uint64_t sent_on = 0;           // the feed packet the latest command followed
+    int late_sends = 0;             // commands sent a packet or more late
     double max_reply_ms = 0.0;      // the controller's slowest ServoJ reply
     bool final_sent = false;        // the last point (or a halt's) has been sent
     double sent_elapsed = 0.0;      // trajectory time of the latest command
@@ -604,6 +601,19 @@ void TrajectoryExecutor::servoLoop()
 
     while (running_)
     {
+        // In step with the controller: right after the packet this command is
+        // due on. A command held up past it (a slow reply) delays the rest of
+        // the stream instead of being made up.
+        {
+            uint64_t want = sent_on == 0 ? commander_->realtimePackets() + 1
+                                         : sent_on + packets_per_command_;
+            uint64_t got = commander_->waitRealtimePacket(want - 1, std::chrono::milliseconds(200));
+            if (got > want)
+                late_sends++;
+            if (got != 0)
+                sent_on = got;      // none for 200 ms: the stale-feed check below stops the arm
+        }
+
         // A trajectory appended during the hold continues the segment from
         // this period: same rhythm, no MovJ.
         {
@@ -618,6 +628,7 @@ void TrajectoryExecutor::servoLoop()
                 settling_ = false;
                 total_duration = timestamps_.back();
                 base = iteration;
+                traj_start = std::chrono::steady_clock::now();
                 final_sent = false;
                 halting = false;
                 rate = 1.0;
@@ -682,9 +693,9 @@ void TrajectoryExecutor::servoLoop()
             int32_t stop_err = 0;
             commander_->sendServoCommand("Stop()", stop_err);
             fail("Realtime feedback stale (" + std::to_string(age_ms) +
-                 " ms since the last packet) during the trajectory; the arm was stopped. "
+                 " ms old) during the trajectory; the arm was stopped. "
                  "Check the TCP 30004 link");
-            logRecentSends(recent, servo_t_);
+            logRecentSends(recent, period);
             break;
         }
 
@@ -696,7 +707,7 @@ void TrajectoryExecutor::servoLoop()
         {
             fail("Robot entered error mode " + std::to_string(mode) +
                  (fault.empty() ? "" : "; " + fault));
-            logRecentSends(recent, servo_t_);
+            logRecentSends(recent, period);
             break;
         }
         // The controller alarms by itself within ~75 ms, and that alarm and the
@@ -704,7 +715,7 @@ void TrajectoryExecutor::servoLoop()
         if (!fault.empty())
         {
             fail(fault);
-            logRecentSends(recent, servo_t_);
+            logRecentSends(recent, period);
             break;
         }
         for (size_t j = 0; j < 6; j++)
@@ -779,14 +790,12 @@ void TrajectoryExecutor::servoLoop()
                       "t=%.4f,aheadtime=%.1f,gain=%.1f)",
                       target[0], target[1], target[2],
                       target[3], target[4], target[5],
-                      servo_t_, aheadtime_, gain_);
+                      period, aheadtime_, gain_);
 
         int32_t err_id = 0;
         auto send_time = std::chrono::steady_clock::now();
         bool ok = commander_->sendServoCommand(std::string(cmd), err_id);
         auto reply_time = std::chrono::steady_clock::now();
-        if (iteration > 0)
-            max_wake_late_ms = std::max(max_wake_late_ms, (since_start(send_time) - due) * 1e3);
         max_reply_ms = std::max(
             max_reply_ms, std::chrono::duration<double, std::milli>(reply_time - send_time).count());
 
@@ -813,7 +822,7 @@ void TrajectoryExecutor::servoLoop()
             std::string why = watch_start ? start_fault(elapsed, commander_->getRealData()) : "";
             fail("ServoJ failed: err_id=" + std::to_string(err_id) +
                  (why.empty() ? "" : "; " + why));
-            logRecentSends(recent, servo_t_);
+            logRecentSends(recent, period);
             break;
         }
 
@@ -845,22 +854,16 @@ void TrajectoryExecutor::servoLoop()
                     state_.halted = halting;
                 }
                 RCLCPP_INFO(kLogger, "Trajectory %s: %.2f s (planned %.2f s), longest gap "
-                            "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent more "
-                            "than 1 ms late; latest wake-up %.1f ms, slowest reply %.1f ms",
+                            "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent a "
+                            "packet or more late; slowest reply %.1f ms",
                             halting ? "halted" : "streamed",
-                            since_start(send_time), total_duration, max_gap_ms,
-                            1000.0 / servo_rate_, late_sends, max_wake_late_ms, max_reply_ms);
+                            std::chrono::duration<double>(send_time - traj_start).count(),
+                            total_duration, max_gap_ms,
+                            period * 1e3, late_sends, max_reply_ms);
             }
         }
 
         iteration++;
-        double sent_at = since_start(send_time);
-        if (sent_at - due > kLateSend)
-            late_sends++;
-        due = nextDue(due, sent_at, period);
-        std::this_thread::sleep_until(
-            start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                             std::chrono::duration<double>(due)));
     }
 
     holding_ = false;

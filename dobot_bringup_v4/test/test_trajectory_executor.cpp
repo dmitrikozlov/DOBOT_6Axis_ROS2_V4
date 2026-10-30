@@ -376,33 +376,6 @@ TEST(TrajectoryExecutorLifecycle, SubsecondTimestamp)
 // Many-segment trajectory (stress test for segment finding)
 // ---------------------------------------------------------------------------
 
-// --- Send schedule: index timing -------------------------------------------
-
-TEST(TrajectoryExecutorSchedule, OnTimeKeepsTheGrid)
-{
-    EXPECT_DOUBLE_EQ(TrajectoryExecutor::nextDue(0.040, 0.0405, 0.02), 0.060);
-}
-
-TEST(TrajectoryExecutorSchedule, LateUnderHalfAPeriodMovesTheGrid)
-{
-    // 9 ms late: the next command waits a full period, not 11 ms
-    EXPECT_DOUBLE_EQ(TrajectoryExecutor::nextDue(0.040, 0.049, 0.02), 0.069);
-}
-
-TEST(TrajectoryExecutorSchedule, LateSendMovesTheGridInsteadOfBunching)
-{
-    // 40 ms late: the next command is one period after the send, not at once
-    EXPECT_DOUBLE_EQ(TrajectoryExecutor::nextDue(0.040, 0.080, 0.02), 0.100);
-}
-
-TEST(TrajectoryExecutorSchedule, NextFollowsTheLastSendByAlmostAPeriod)
-{
-    const double period = 0.02;
-    for (double late : {0.0, 0.0005, 0.001, 0.0015, 0.005, 0.0101, 0.03, 0.2})
-        EXPECT_GE(TrajectoryExecutor::nextDue(1.0, 1.0 + late, period) - (1.0 + late),
-                  period - TrajectoryExecutor::kLateSend - 1e-12)
-            << "late " << late;
-}
 
 TEST(TrajectoryExecutorInterp, ManySegments)
 {
@@ -575,4 +548,54 @@ TEST(TrajectoryExecutorHalt, NoFasterThanOnePeriod)
     EXPECT_NEAR(TrajectoryExecutor::haltRateStep(5.0, 2000.0, 0.02), 1.0, kTol);
     EXPECT_NEAR(TrajectoryExecutor::haltRateStep(0.0, 2000.0, 0.02), 1.0, kTol);
     EXPECT_NEAR(TrajectoryExecutor::haltRateStep(40.0, 0.0, 0.02), 1.0, kTol);
+}
+
+// ---------------------------------------------------------------------------
+// FeedLag: how late realtime packets are read, by the controller's clock
+// ---------------------------------------------------------------------------
+
+TEST(FeedLag, PacketsReadOnTimeHaveNoLag)
+{
+    FeedLag lag;
+    for (int i = 0; i < 100; i++)
+        EXPECT_NEAR(lag.update(5000.0 + i * 8.2, 1000 + static_cast<uint64_t>(i * 8.2)), 0.0, 1.0);
+}
+
+TEST(FeedLag, AQueueInTheSocketShowsAsLag)
+{
+    FeedLag lag;
+    for (int i = 0; i < 100; i++)
+        lag.update(5000.0 + i * 8.0, 1000 + i * 8);
+    // Stalled 2 s: the queued packets then arrive together, each 2 s late at first.
+    double first = lag.update(7000.0 + 800.0, 1000 + 100 * 8);
+    EXPECT_NEAR(first, 2000.0, 1.0);
+}
+
+TEST(FeedLag, ClockDriftIsNotLag)
+{
+    FeedLag lag;
+    // The Pi's clock runs 50 ppm fast: an hour of packets every 8 ms.
+    double worst = 0.0;
+    for (int i = 0; i < 450000; i++)
+    {
+        double t = i * 8.0;
+        worst = std::max(worst, lag.update(t * (1.0 + 50e-6), static_cast<uint64_t>(t)));
+    }
+    EXPECT_LT(worst, 2.0);
+}
+
+TEST(FeedLag, TheControllerClockGoingBackStartsAgain)
+{
+    FeedLag lag;
+    lag.update(5000.0, 900000);
+    EXPECT_NEAR(lag.update(9000.0, 100), 0.0, 1e-9);
+    EXPECT_NEAR(lag.update(9008.0, 108), 0.0, 1e-9);
+}
+
+TEST(FeedLag, ResetStartsAgain)
+{
+    FeedLag lag;
+    lag.update(5000.0, 1000);
+    lag.reset();
+    EXPECT_NEAR(lag.update(9000.0, 1008), 0.0, 1e-9);
 }
