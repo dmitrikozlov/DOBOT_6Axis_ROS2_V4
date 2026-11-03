@@ -13,9 +13,24 @@ With --shape-hz F the move goes through a ZV input shaper for a mode of F Hz
 later, weighted so the mode's swing from the first is cancelled by the second.
 The move takes half a period longer.
 
+With --t-scale S each ServoJ carries t = S x its send interval while the
+trajectory still advances by the interval: S > 1 sends each target before the
+controller has finished the previous one (Dobot: send at t or earlier, by 3 %
+or more).
+
 With --timer PERIOD the ServoJ go out by the Pi's clock every PERIOD s
 instead, with t = PERIOD: in step with a controller clock of an exact PERIOD
 divisor, if it runs on one.
+
+With --cycles N the ServoJ go out right after every N-th block of the
+controller's log port 65511, with t = N x 4 ms: the controller's motion module
+logs one [ch8] block per 4 ms cycle and takes ServoJ on that grid, dividing
+each step by min(t, the gap in whole cycles), so commands must arrive exactly N
+cycles apart for the target speed to stay even. With --track-phase as well,
+field 84 of each block (the queue number being executed) shows the cycle each
+command was taken up in; a command taken up a cycle later than usual (counted
+from the block it followed) means the commands sit near the late edge, and they
+move 1 ms earlier; one taken up early, 1 ms later.
 
 Each stream starts with a MovJ to the arm's own joints. Files per leg in the
 results directory: commands.csv (one row per ServoJ) and realtime.csv.
@@ -25,9 +40,81 @@ results directory: commands.csv (one row per ServoJ) and realtime.csv.
 import csv
 import math
 import os
+import re
+import socket
+import threading
 import time
 
 import dobot_proto as dp
+
+ALGS_LOG_PORT = 65511    # the controller's motion-module log: one [ch8] block per cycle
+ALGS_CYCLE = 0.004       # s
+EXECUTING = re.compile(rb'\n84:(\d+)')   # field 84 of a block: the queue number being executed
+PHASE_STEP_MS = 1.0      # a step away from the edge a command was taken up beyond
+PHASE_BASELINE = 3       # commands since the last step before their usual take-up delay counts
+
+
+class CycleClock(threading.Thread):
+    """Counts the [ch8] blocks on port 65511, keeping each one's arrival time
+    (host monotonic), so commands can be sent on the controller's own cycle.
+    Field 84 of a block is the queue number the controller is executing:
+    taken[n] is the first block (1-based, as count) in which n appears."""
+
+    MARK = b'[ch8]'
+
+    def __init__(self, ip):
+        super().__init__(daemon=True)
+        self.sock = socket.create_connection((ip, ALGS_LOG_PORT), timeout=3.0)
+        self.sock.settimeout(1.0)
+        self.count = 0
+        self.times = []
+        self.taken = {}
+        self.lock = threading.Lock()
+
+    def run(self):
+        tail = b''
+        text, parsed = None, 0      # unparsed text from the first mark on; blocks parsed
+        while True:
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not chunk:
+                return
+            t = dp.now()
+            data = tail + chunk
+            n = data.count(self.MARK)
+            tail = data[-(len(self.MARK) - 1):]     # a mark split across chunks
+            with self.lock:
+                self.times.extend([t] * n)
+                self.count += n
+            # field 84 of every complete block (one is complete when the next starts)
+            text = chunk if text is None else text + chunk
+            if parsed == 0 and self.MARK not in text:
+                text = text[-(len(self.MARK) - 1):]
+                continue
+            start = text.find(self.MARK)
+            ends = []
+            i = text.find(self.MARK, start + 1)
+            while i >= 0:
+                ends.append(i)
+                i = text.find(self.MARK, i + 1)
+            for end in ends:
+                parsed += 1
+                m = EXECUTING.search(text, start, end)
+                if m:
+                    with self.lock:
+                        self.taken.setdefault(int(m.group(1)), parsed)
+                start = end
+            text = text[start:]
+
+    def stop(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
 
 
 def scurve_1d(distance, vmax, amax):
@@ -75,7 +162,7 @@ def wait_enable(rt, timeout=5.0):
     return False
 
 
-def stream(dash, rt, q_from, q_to, args, period):
+def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
     lead = max(range(6), key=lambda j: abs(q_to[j] - q_from[j]))
     span = q_to[lead] - q_from[lead]
     seg, duration = scurve_1d(abs(span), args.speed, args.accel)
@@ -92,24 +179,69 @@ def stream(dash, rt, q_from, q_to, args, period):
         if args.timer:
             time.sleep(max(0.0, start + k * period - dp.now()))
             want = got = rt.count
+        elif cycles is not None:
+            want = cycles.count + 1 if sent_on == 0 else sent_on + args.cycles
+            while cycles.count < want:
+                time.sleep(0.0002)
+            got = cycles.count
+            delay = args.cycle_delay
+            if phase is not None:
+                # take-up delay: cycles from the block a command followed to the block
+                # in which the controller took it; it varies when we sit at a cycle edge
+                with cycles.lock:
+                    for c in phase['sent'][-20:]:
+                        if c['lag'] is None and c['queue'] in cycles.taken:
+                            c['lag'] = cycles.taken[c['queue']] - c['block']
+                lags = [c['lag'] for c in phase['sent'] if c['regime'] == phase['regime']
+                        and c['lag'] is not None]
+                if len(lags) >= PHASE_BASELINE:
+                    phase['usual'] = max(set(lags), key=lags.count)
+                odd = [g for g in lags if phase['usual'] is not None and g != phase['usual']]
+                if odd:
+                    # taken a cycle late: we are near the late edge, so earlier; early: later
+                    step = -PHASE_STEP_MS if odd[0] > phase['usual'] else PHASE_STEP_MS
+                    unwrapped = phase['delay'] + step
+                    phase['delay'] = unwrapped % (ALGS_CYCLE * 1000.0)
+                    # past 0 or a whole cycle the send moves to the neighbouring block's
+                    # cycle, and every take-up delay with it
+                    phase['usual'] += round((phase['delay'] - unwrapped) / (ALGS_CYCLE * 1000.0))
+                    phase['regime'] += 1
+                    phase['shifts'].append((k, '%d not %d' % (odd[0], phase['usual']),
+                                            phase['delay']))
+                delay = phase['delay']
+            if delay:
+                # the commands' place in the cycle: away from its edge, jitter cannot move them across
+                with cycles.lock:
+                    due = cycles.times[got - 1] + delay / 1000.0
+                time.sleep(max(0.0, due - dp.now()))
         else:
             want = rt.count + 1 if sent_on == 0 else sent_on + args.every
             while rt.count < want:
                 time.sleep(0.0002)
             got = rt.count
-        with rt.lock:
-            arrived = rt.packets[got - 1][0]
+        if cycles is not None:
+            with cycles.lock:
+                arrived = cycles.times[got - 1]
+        else:
+            with rt.lock:
+                arrived = rt.packets[got - 1][0]
         sent_on = got
         traj_t = min(k * period, duration)
         f = seg(traj_t) / abs(span)
         target = [a + (b - a) * f for a, b in zip(q_from, q_to)]
         t_wake = dp.now()
-        rep = dash.query(dp.servoj_cmd(target, period, args.aheadtime, args.gain))
+        rep = dash.query(dp.servoj_cmd(target, period * args.t_scale, args.aheadtime, args.gain))
         rows.append({'k': k, 'traj_t': traj_t, 'want': want, 'got': got, 'packet_arrived': arrived,
                      't_wake': t_wake, 't_send': rep.t_send, 't_reply': rep.t_recv,
-                     'reply': rep.raw, 'target_lead': target[lead]})
+                     'reply': rep.raw, 'target_lead': target[lead],
+                     'delay_ms': phase['delay'] if phase is not None else args.cycle_delay})
         if rep.err != 0:
             raise SystemExit('ServoJ rejected: %s' % rep.raw)
+        if phase is not None:
+            queue = re.match(r'\s*0,\{(\d+)\}', rep.raw)
+            if queue:
+                phase['sent'].append({'queue': int(queue.group(1)), 'block': got,
+                                      'regime': phase['regime'], 'lag': None})
         if traj_t >= duration:
             break
         k += 1
@@ -127,8 +259,18 @@ def main():
     p.add_argument('--every', type=int, default=3)
     p.add_argument('--timer', type=float, default=0.0,
                    help='send by the clock every this many s (t the same) instead of on packets')
+    p.add_argument('--cycles', type=int, default=0,
+                   help="send after every this many 4 ms cycles of the controller's motion "
+                        "module (port 65511), t = cycles x 4 ms, instead of on packets")
+    p.add_argument('--cycle-delay', type=float, default=0.0,
+                   help='with --cycles: ms to wait after the block before sending')
+    p.add_argument('--track-phase', action='store_true',
+                   help="with --cycles: move the commands half a cycle whenever the cycles "
+                        "until the controller takes them up (port 65511 field 84) vary")
     p.add_argument('--shape-hz', type=float, default=0.0, help='ZV input shaper for a mode at this Hz')
     p.add_argument('--shape-zeta', type=float, default=0.04, help="the mode's damping ratio")
+    p.add_argument('--t-scale', type=float, default=1.0,
+                   help="ServoJ t as a multiple of the send interval")
     p.add_argument('--reps', type=int, default=2)
     args = p.parse_args()
     delta = [float(v) for v in args.delta.split(',')]
@@ -141,18 +283,41 @@ def main():
     n0, t0 = rt.count, dp.now()
     time.sleep(3.0)
     feed = (dp.now() - t0) / (rt.count - n0)
+    cycles = phase = None
+    if args.track_phase and not args.cycles:
+        raise SystemExit('--track-phase needs --cycles')
     if args.timer:
         period = args.timer
         s.log('feed period %.4f ms; a ServoJ every %.2f ms by the clock' % (feed * 1e3, period * 1e3))
+    elif args.cycles:
+        cycles = CycleClock(args.ip)
+        cycles.start()
+        c0, t0 = cycles.count, dp.now()
+        time.sleep(2.0)
+        if cycles.count - c0 < 100:
+            raise SystemExit('port %d gave %d [ch8] blocks in 2 s: no cycle to pace on'
+                             % (ALGS_LOG_PORT, cycles.count - c0))
+        period = args.cycles * ALGS_CYCLE
+        s.log('feed period %.4f ms; motion-module cycle %.4f ms (port %d); a ServoJ every %d '
+              'cycles, %.1f ms after the block, t=%.2f ms'
+              % (feed * 1e3, (dp.now() - t0) / (cycles.count - c0) * 1e3, ALGS_LOG_PORT,
+                 args.cycles, args.cycle_delay, period * args.t_scale * 1e3))
+        if args.track_phase:
+            phase = {'delay': args.cycle_delay, 'regime': 0, 'sent': [], 'shifts': [],
+                     'usual': None}
+            s.log('tracking the phase on port %d field 84: %.0f ms earlier when a command is '
+                  'taken up a cycle late, later when early' % (ALGS_LOG_PORT, PHASE_STEP_MS))
     else:
         period = args.every * feed
-        s.log('feed period %.4f ms; a ServoJ every %d packets (%.2f ms)'
-              % (feed * 1e3, args.every, period * 1e3))
+        s.log('feed period %.4f ms; a ServoJ every %d packets (%.2f ms), t=%.2f ms'
+              % (feed * 1e3, args.every, period * 1e3, period * args.t_scale * 1e3))
     dp.confirm(['', 'Plan: by [%s] deg and back, %d times, the leading joint at %g deg/s.'
                 % (args.delta, args.reps, args.speed)], args.yes, s.log)
     for rep in range(args.reps):
         for name, qa, qb in (('out', q0, q1), ('back', q1, q0)):
-            rows, packets = stream(dash, rt, list(rt.current(max_age=0.5)['q_actual']), qb, args, period)
+            shifts_before = len(phase['shifts']) if phase is not None else 0
+            rows, packets = stream(dash, rt, list(rt.current(max_age=0.5)['q_actual']), qb, args,
+                                   period, cycles, phase)
             d = s.run_dir('%s_%d' % (name, rep + 1))
             with open(os.path.join(d, 'commands.csv'), 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -163,7 +328,15 @@ def main():
             late = sum(1 for r in rows if r['got'] > r['want'])
             s.log('%s %d: %d ServoJ, slowest reply %.1f ms, %d followed a later packet than due'
                   % (name, rep + 1, len(rows), slow, late))
+            if phase is not None:
+                shifts = phase['shifts'][shifts_before:]
+                lags = [c['lag'] for c in phase['sent'][-len(rows):] if c['lag'] is not None]
+                s.log('    phase shifts: %d%s; take-up delays (cycles: count) %s' % (
+                    len(shifts), ''.join(' (command %d: delay %s -> %.0f ms)' % x for x in shifts),
+                    {v: lags.count(v) for v in sorted(set(lags))}))
             time.sleep(1.0)
+    if cycles is not None:
+        cycles.stop()
     rt.stop()
 
 
