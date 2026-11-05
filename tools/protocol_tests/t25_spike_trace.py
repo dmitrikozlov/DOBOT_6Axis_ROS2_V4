@@ -32,6 +32,10 @@ command was taken up in; a command taken up a cycle later than usual (counted
 from the block it followed) means the commands sit near the late edge, and they
 move 1 ms earlier; one taken up early, 1 ms later.
 
+With --line X,Y,Z the move is a straight line of the tool (mm, base axes) by
+ServoP, at --speed mm/s and --accel mm/s^2, for comparison with Dobot's ServoP
+reference loop (servop_ref.py).
+
 Each stream starts with a MovJ to the arm's own joints. Files per leg in the
 results directory: commands.csv (one row per ServoJ) and realtime.csv.
 
@@ -162,12 +166,44 @@ def wait_enable(rt, timeout=5.0):
     return False
 
 
+def servop_cmd(target, servo_t, aheadtime, gain):
+    return ('ServoP(%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,t=%.4f,aheadtime=%g,gain=%g)'
+            % (tuple(target) + (servo_t, aheadtime, gain)))
+
+
+def line_knots(dash, p_from, p_to, q_near, step_mm=5.0):
+    """Joints along a tool line from the controller's IK, every step_mm (each
+    solution nearest the last), for ServoJ."""
+    n = max(2, math.ceil(math.dist(p_from[:3], p_to[:3]) / step_mm))
+    knots, q = [], q_near
+    for i in range(n + 1):
+        p = [a + (b - a) * i / n for a, b in zip(p_from, p_to)]
+        r = dash.query('InverseKin(%s,useJointNear=1,jointNear={%s})'
+                       % (','.join('%.4f' % v for v in p), ','.join('%.4f' % v for v in q)))
+        m = re.match(r'\s*0,\{([^}]*)\}', r.raw)
+        if not m:
+            raise SystemExit('no IK %d mm along the line: %s' % (i * step_mm, r.raw))
+        q = [float(v) for v in m.group(1).split(',')]
+        knots.append(q)
+    return knots
+
+
 def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
-    lead = max(range(6), key=lambda j: abs(q_to[j] - q_from[j]))
-    span = q_to[lead] - q_from[lead]
+    """q_from, q_to: joints (deg), or with --line tool poses (mm, deg)."""
+    knots = None
+    if args.line:
+        lead, span = 0, math.dist(q_from[:3], q_to[:3])
+        q_here = list(rt.current(max_age=0.5)['q_actual'])
+        if args.line_servoj:
+            knots = line_knots(dash, q_from, q_to, q_here)
+    else:
+        lead = max(range(6), key=lambda j: abs(q_to[j] - q_from[j]))
+        span = q_to[lead] - q_from[lead]
+        q_here = q_from
     seg, duration = scurve_1d(abs(span), args.speed, args.accel)
     seg, duration = zv_shaper(seg, duration, args.shape_hz, args.shape_zeta)
-    r = dash.query('MovJ(joint={%s},a=20,v=5)' % ','.join('%.4f' % v for v in q_from))
+    command = servop_cmd if args.line and knots is None else dp.servoj_cmd
+    r = dash.query('MovJ(joint={%s},a=20,v=5)' % ','.join('%.4f' % v for v in q_here))
     if r.err != 0:
         raise SystemExit('MovJ rejected: %s' % r.raw)
     i0 = rt.index()
@@ -226,11 +262,16 @@ def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
             with rt.lock:
                 arrived = rt.packets[got - 1][0]
         sent_on = got
-        traj_t = min(k * period, duration)
+        traj_t = min(max(0.0, k * period - args.hold), duration)
         f = seg(traj_t) / abs(span)
-        target = [a + (b - a) * f for a, b in zip(q_from, q_to)]
+        if knots is None:
+            target = [a + (b - a) * f for a, b in zip(q_from, q_to)]
+        else:
+            x = f * (len(knots) - 1)
+            i = min(int(x), len(knots) - 2)
+            target = [a + (b - a) * (x - i) for a, b in zip(knots[i], knots[i + 1])]
         t_wake = dp.now()
-        rep = dash.query(dp.servoj_cmd(target, period * args.t_scale, args.aheadtime, args.gain))
+        rep = dash.query(command(target, period * args.t_scale, args.aheadtime, args.gain))
         rows.append({'k': k, 'traj_t': traj_t, 'want': want, 'got': got, 'packet_arrived': arrived,
                      't_wake': t_wake, 't_send': rep.t_send, 't_reply': rep.t_recv,
                      'reply': rep.raw, 'target_lead': target[lead],
@@ -254,6 +295,11 @@ def main():
     p = dp.base_parser(__doc__.splitlines()[0], motion=True)
     p.set_defaults(aheadtime=100.0, gain=500.0)
     p.add_argument('--delta', default='80,-8,12,0,0,0', help='deg per joint')
+    p.add_argument('--line', default=None,
+                   help='mm, x,y,z: a straight line of the tool by ServoP instead of --delta '
+                        '(--speed mm/s, --accel mm/s^2)')
+    p.add_argument('--line-servoj', action='store_true',
+                   help='with --line: ServoJ to joints from the controller\'s IK along the line')
     p.add_argument('--speed', type=float, default=38.0, help="the leading joint's peak, deg/s")
     p.add_argument('--accel', type=float, default=45.0, help="its peak acceleration, deg/s^2")
     p.add_argument('--every', type=int, default=3)
@@ -271,14 +317,24 @@ def main():
     p.add_argument('--shape-zeta', type=float, default=0.04, help="the mode's damping ratio")
     p.add_argument('--t-scale', type=float, default=1.0,
                    help="ServoJ t as a multiple of the send interval")
+    p.add_argument('--hold', type=float, default=0.0,
+                   help='s: send the start point this long before moving; the primer MovJ can take '
+                        '~170 ms after a stream, and the controller skips the ServoJ queued behind it')
     p.add_argument('--reps', type=int, default=2)
     args = p.parse_args()
-    delta = [float(v) for v in args.delta.split(',')]
-    if args.speed > 60:
-        raise SystemExit('over 60 deg/s')
+    if args.line:
+        delta = [float(v) for v in args.line.split(',')] + [0.0, 0.0, 0.0]
+        if args.speed > 250:
+            raise SystemExit("over 250 mm/s, the safety level's tool speed")
+    else:
+        delta = [float(v) for v in args.delta.split(',')]
+        if args.speed > 60:
+            raise SystemExit('over 60 deg/s')
     s = dp.Session(args.out, 't25_spike_trace', args)
     dash, rt = dp.connect(args, s.log)
     q0 = dp.preflight(dash, rt, s.log)
+    if args.line:
+        q0 = list(rt.current(max_age=0.5)['tool_vector_actual'])
     q1 = [a + d for a, d in zip(q0, delta)]
     n0, t0 = rt.count, dp.now()
     time.sleep(3.0)
@@ -311,12 +367,16 @@ def main():
         period = args.every * feed
         s.log('feed period %.4f ms; a ServoJ every %d packets (%.2f ms), t=%.2f ms'
               % (feed * 1e3, args.every, period * 1e3, period * args.t_scale * 1e3))
-    dp.confirm(['', 'Plan: by [%s] deg and back, %d times, the leading joint at %g deg/s.'
+    dp.confirm(['', 'Plan: by [%s] mm and back by ServoP, %d times, at %g mm/s.'
+                % (args.line, args.reps, args.speed) if args.line else
+                'Plan: by [%s] deg and back, %d times, the leading joint at %g deg/s.'
                 % (args.delta, args.reps, args.speed)], args.yes, s.log)
     for rep in range(args.reps):
         for name, qa, qb in (('out', q0, q1), ('back', q1, q0)):
             shifts_before = len(phase['shifts']) if phase is not None else 0
-            rows, packets = stream(dash, rt, list(rt.current(max_age=0.5)['q_actual']), qb, args,
+            # a line runs between its two planned ends; a joint move from where the arm stands
+            start = qa if args.line else list(rt.current(max_age=0.5)['q_actual'])
+            rows, packets = stream(dash, rt, start, qb, args,
                                    period, cycles, phase)
             d = s.run_dir('%s_%d' % (name, rep + 1))
             with open(os.path.join(d, 'commands.csv'), 'w', newline='') as f:
