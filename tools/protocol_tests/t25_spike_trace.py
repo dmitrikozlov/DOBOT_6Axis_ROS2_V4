@@ -56,13 +56,17 @@ ALGS_CYCLE = 0.004       # s
 EXECUTING = re.compile(rb'\n84:(\d+)')   # field 84 of a block: the queue number being executed
 PHASE_STEP_MS = 1.0      # a step away from the edge a command was taken up beyond
 PHASE_BASELINE = 3       # commands since the last step before their usual take-up delay counts
+CLOCK_DRIFT = 1e-4       # the fitted cycle clock may run this much late per s (100 ppm)
 
 
 class CycleClock(threading.Thread):
     """Counts the [ch8] blocks on port 65511, keeping each one's arrival time
     (host monotonic), so commands can be sent on the controller's own cycle.
     Field 84 of a block is the queue number the controller is executing:
-    taken[n] is the first block (1-based, as count) in which n appears."""
+    taken[n] is the first block (1-based, as count) in which n appears.
+    due(k) is when block k is sent, from the earliest arrivals: block k at
+    base + k x 4 ms, base the smallest arrival - k x 4 ms seen, which may rise by
+    CLOCK_DRIFT so that the two clocks drifting apart is not read as lateness."""
 
     MARK = b'[ch8]'
 
@@ -73,7 +77,12 @@ class CycleClock(threading.Thread):
         self.count = 0
         self.times = []
         self.taken = {}
+        self.base = None
         self.lock = threading.Lock()
+
+    def due(self, k):
+        with self.lock:
+            return self.base + k * ALGS_CYCLE
 
     def run(self):
         tail = b''
@@ -93,6 +102,11 @@ class CycleClock(threading.Thread):
             tail = data[-(len(self.MARK) - 1):]     # a mark split across chunks
             with self.lock:
                 self.times.extend([t] * n)
+                if n and self.base is not None:
+                    self.base = min(t - (self.count + n) * ALGS_CYCLE,
+                                    self.base + CLOCK_DRIFT * (t - self.times[-n - 1]))
+                elif n:
+                    self.base = t - (self.count + n) * ALGS_CYCLE
                 self.count += n
             # field 84 of every complete block (one is complete when the next starts)
             text = chunk if text is None else text + chunk
@@ -217,9 +231,12 @@ def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
             want = got = rt.count
         elif cycles is not None:
             want = cycles.count + 1 if sent_on == 0 else sent_on + args.cycles
-            while cycles.count < want:
-                time.sleep(0.0002)
-            got = cycles.count
+            if not args.cycle_model:
+                while cycles.count < want:
+                    time.sleep(0.0002)
+                got = cycles.count
+            else:
+                got = want
             delay = args.cycle_delay
             if phase is not None:
                 # take-up delay: cycles from the block a command followed to the block
@@ -245,7 +262,14 @@ def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
                     phase['shifts'].append((k, '%d not %d' % (odd[0], phase['usual']),
                                             phase['delay']))
                 delay = phase['delay']
-            if delay:
+            if args.cycle_model:
+                # on the fitted clock, not on the block's arrival: blocks reach us up
+                # to ~4.5 ms late (99th percentile), which moved commands across a cycle
+                due = cycles.due(got) + delay / 1000.0
+                time.sleep(max(0.0, due - dp.now() - 0.0005))
+                while dp.now() < due:
+                    pass
+            elif delay:
                 # the commands' place in the cycle: away from its edge, jitter cannot move them across
                 with cycles.lock:
                     due = cycles.times[got - 1] + delay / 1000.0
@@ -255,7 +279,9 @@ def stream(dash, rt, q_from, q_to, args, period, cycles=None, phase=None):
             while rt.count < want:
                 time.sleep(0.0002)
             got = rt.count
-        if cycles is not None:
+        if cycles is not None and args.cycle_model:
+            arrived = cycles.due(got)
+        elif cycles is not None:
             with cycles.lock:
                 arrived = cycles.times[got - 1]
         else:
@@ -310,6 +336,9 @@ def main():
                         "module (port 65511), t = cycles x 4 ms, instead of on packets")
     p.add_argument('--cycle-delay', type=float, default=0.0,
                    help='with --cycles: ms to wait after the block before sending')
+    p.add_argument('--cycle-model', action='store_true',
+                   help="with --cycles: send on a clock fitted to the blocks' earliest "
+                        "arrivals instead of on each block's arrival")
     p.add_argument('--track-phase', action='store_true',
                    help="with --cycles: move the commands half a cycle whenever the cycles "
                         "until the controller takes them up (port 65511 field 84) vary")
