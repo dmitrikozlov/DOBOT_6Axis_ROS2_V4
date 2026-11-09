@@ -533,7 +533,7 @@ bool CRCommanderRos2::callRosService(const std::string cmd, int32_t &err_id, std
     }
 }
 
-bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id)
+bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id, uint64_t *queue)
 {
     std::lock_guard<std::mutex> lock(dash_mutex_);
     try
@@ -552,6 +552,8 @@ bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id)
 
         // Parse error ID (number before first '{').
         err_id = 0;
+        if (queue)
+            *queue = 0;
         for (int i = 0; buf[i] != '\0'; i++)
         {
             if (buf[i] == '{')
@@ -562,6 +564,8 @@ bool CRCommanderRos2::sendServoCommand(const std::string &cmd, int32_t &err_id)
                        (num_str.back() == ',' || num_str.back() == ' '))
                     num_str.pop_back();
                 err_id = std::atoi(num_str.c_str());
+                if (queue)
+                    *queue = std::strtoull(buf + i + 1, nullptr, 10);
                 break;
             }
         }

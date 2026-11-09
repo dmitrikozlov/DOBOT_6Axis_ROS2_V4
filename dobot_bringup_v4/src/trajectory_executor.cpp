@@ -220,6 +220,12 @@ TrajectoryExecutor::~TrajectoryExecutor()
     stop();
 }
 
+void TrajectoryExecutor::setCycleClock(std::shared_ptr<CycleClock> clock, int cycles_per_command)
+{
+    cycle_clock_ = std::move(clock);
+    cycles_per_command_ = std::max(1, cycles_per_command);
+}
+
 // Point times (s) and joint positions (deg) of traj.
 static void toDegrees(const trajectory_msgs::msg::JointTrajectory &traj,
                       std::vector<double> &times, std::vector<std::array<double, 6>> &joints)
@@ -444,14 +450,36 @@ void TrajectoryExecutor::servoLoop()
                         rt_priority_, std::strerror(err));
     }
 
-    // Each command covers packets_per_command_ controller cycles: its t, and
-    // the trajectory time between commands.
-    const double period = packets_per_command_ * commander_->realtimePeriodS();
-    RCLCPP_INFO(kLogger,
-                "Servo loop started: a ServoJ every %d feed packets (%.2f ms), "
-                "aheadtime=%.1f, gain=%.1f, points=%zu",
-                packets_per_command_, period * 1e3, aheadtime_, gain_,
-                joints_deg_.size());
+    // Each command covers packets_per_command_ feed packets, or
+    // cycles_per_command_ motion cycles: its t, and the trajectory time
+    // between commands.
+    bool on_cycles = cycle_clock_ && cycle_clock_->alive();
+    if (cycle_clock_ && on_cycles == cycles_warned_)
+    {
+        cycles_warned_ = !on_cycles;
+        if (on_cycles)
+            RCLCPP_INFO(kLogger, "Port %d gives the motion cycle again: pacing on it",
+                        CycleClock::kPort);
+        else
+            RCLCPP_WARN(kLogger, "Port %d gives no motion cycle: pacing on the realtime feed, "
+                        "whose commands the controller takes unevenly (more vibration)",
+                        CycleClock::kPort);
+    }
+    const double period = on_cycles ? cycles_per_command_ * CycleClock::kCycleS
+                                    : packets_per_command_ * commander_->realtimePeriodS();
+    if (on_cycles)
+        RCLCPP_INFO(kLogger,
+                    "Servo loop started: a ServoJ every %d motion cycles (%.2f ms), %.0f ms "
+                    "after the block, aheadtime=%.1f, gain=%.1f, points=%zu",
+                    cycles_per_command_, period * 1e3, phase_.delayMs(), aheadtime_, gain_,
+                    joints_deg_.size());
+    else
+        RCLCPP_INFO(kLogger,
+                    "Servo loop started: a ServoJ every %d feed packets (%.2f ms), "
+                    "aheadtime=%.1f, gain=%.1f, points=%zu",
+                    packets_per_command_, period * 1e3, aheadtime_, gain_,
+                    joints_deg_.size());
+    const int shifts_before = phase_.shifts();
 
     // Wait for robot to be in ENABLE mode (5) before streaming ServoJ.
     // ServoJ is rejected if the robot is still RUNNING (7) from a
@@ -602,9 +630,36 @@ void TrajectoryExecutor::servoLoop()
 
     while (running_)
     {
-        // In step with the controller: right after the packet this command is
-        // due on. A command held up past it (a slow reply) delays the rest of
-        // the stream instead of being made up.
+        // In step with the controller: right after the motion cycle's block, or
+        // the feed packet, this command is due on. A command held up past it (a
+        // slow reply) delays the rest of the stream instead of being made up.
+        if (on_cycles)
+        {
+            uint64_t want = sent_on == 0 ? cycle_clock_->count() + 1
+                                         : sent_on + cycles_per_command_;
+            uint64_t got = cycle_clock_->waitBlock(want, std::chrono::milliseconds(50));
+            if (got == 0)
+            {
+                // Same t on the feed: the trajectory runs a few % slower.
+                RCLCPP_WARN(kLogger, "Port %d stopped giving the motion cycle: the stream "
+                            "continues on the realtime feed", CycleClock::kPort);
+                on_cycles = false;
+                cycles_warned_ = true;
+                sent_on = 0;
+            }
+            else
+            {
+                if (got > want)
+                    late_sends++;
+                sent_on = got;
+                double delay_ms = phase_.update(
+                    [this](uint64_t q) { return cycle_clock_->takenIn(q); });
+                std::this_thread::sleep_until(
+                    cycle_clock_->arrival(got) +
+                    std::chrono::microseconds(static_cast<int64_t>(delay_ms * 1e3)));
+            }
+        }
+        if (!on_cycles)
         {
             uint64_t want = sent_on == 0 ? commander_->realtimePackets() + 1
                                          : sent_on + packets_per_command_;
@@ -821,8 +876,11 @@ void TrajectoryExecutor::servoLoop()
                       period, aheadtime_, gain_);
 
         int32_t err_id = 0;
+        uint64_t queue = 0;
         auto send_time = std::chrono::steady_clock::now();
-        bool ok = commander_->sendServoCommand(std::string(cmd), err_id);
+        bool ok = commander_->sendServoCommand(std::string(cmd), err_id, &queue);
+        if (on_cycles && queue != 0)
+            phase_.sent(queue, sent_on);
         auto reply_time = std::chrono::steady_clock::now();
         max_reply_ms = std::max(
             max_reply_ms, std::chrono::duration<double, std::milli>(reply_time - send_time).count());
@@ -883,11 +941,17 @@ void TrajectoryExecutor::servoLoop()
                 }
                 RCLCPP_INFO(kLogger, "Trajectory %s: %.2f s (planned %.2f s), longest gap "
                             "between ServoJ commands %.1f ms (nominal %.1f ms), %d sent a "
-                            "packet or more late; slowest reply %.1f ms",
+                            "%s or more late; slowest reply %.1f ms%s",
                             halting ? "halted" : "streamed",
                             std::chrono::duration<double>(send_time - traj_start).count(),
                             total_duration, max_gap_ms,
-                            period * 1e3, late_sends, max_reply_ms);
+                            period * 1e3, late_sends, on_cycles ? "cycle" : "packet",
+                            max_reply_ms,
+                            on_cycles ? (", " + std::to_string(phase_.shifts() - shifts_before) +
+                                         " phase steps, now " +
+                                         std::to_string(static_cast<int>(phase_.delayMs())) +
+                                         " ms after the block").c_str()
+                                      : "");
             }
         }
 

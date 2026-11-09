@@ -340,6 +340,17 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
     trajectory_executor_ = std::make_shared<TrajectoryExecutor>(
         commander_, servoPackets, servoAheadtime, servoGain, servoRtPriority);
+    // Pacing on the controller's 4 ms motion cycle, read from its debug port
+    // 65511 (cycle_clock.h); without the port, on the feed as above.
+    this->declare_parameter("servo_cycle_tracking", true);
+    this->declare_parameter("servo_cycles_per_command", 6);
+    if (this->get_parameter("servo_cycle_tracking").as_bool())
+    {
+        auto cycles = std::make_shared<CycleClock>(robotIp);
+        cycles->start();
+        trajectory_executor_->setCycleClock(
+            cycles, static_cast<int>(this->get_parameter("servo_cycles_per_command").as_int()));
+    }
     // A cancel during a stream slows the tool along the path at this rate.
     this->declare_parameter("halt_decel_mm_s2", 2000.0);
     double haltDecel = this->get_parameter("halt_decel_mm_s2").as_double();
@@ -366,10 +377,12 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
 
     RCLCPP_INFO(this->get_logger(),
                 "FollowJointTrajectory action server ready at %s "
-                "(a ServoJ every %d feed packets, ahead=%.1f, gain=%.1f; arrival within %.3f deg, "
+                "(a ServoJ every %d feed packets, or %d motion cycles while port 65511 answers; ahead=%.1f, gain=%.1f; arrival within %.3f deg, "
                 "%.2f s; halt at %.0f mm/s^2; hold %.1f s)",
                 fjtActionName.c_str(),
-                servoPackets, servoAheadtime, servoGain,
+                servoPackets,
+                static_cast<int>(this->get_parameter("servo_cycles_per_command").as_int()),
+                servoAheadtime, servoGain,
                 goal_tolerance_deg_, goal_time_tolerance_, haltDecel, holdS);
 }
 

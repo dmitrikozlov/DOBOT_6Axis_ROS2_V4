@@ -22,6 +22,7 @@
 
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 #include <dobot_bringup/command.h>
+#include <dobot_bringup/cycle_clock.h>
 
 class TrajectoryExecutor
 {
@@ -49,6 +50,12 @@ public:
                        int rt_priority = 0);
 
     ~TrajectoryExecutor();
+
+    // Pace on the controller's 4 ms motion cycle instead (cycle_clock.h): a
+    // ServoJ every cycles_per_command cycles, t = cycles_per_command x 4 ms. A
+    // stream that starts while the clock has no blocks paces on the feed, and
+    // one that loses them continues on the feed with the same t.
+    void setCycleClock(std::shared_ptr<CycleClock> clock, int cycles_per_command);
 
     // Load a new trajectory.  Stops current execution if running.
     // Joint positions must be in radians (ROS convention) and in the order of
@@ -197,6 +204,10 @@ private:
     double aheadtime_;
     double gain_;
     int rt_priority_;               // SCHED_FIFO priority of the servo thread; 0: none
+    std::shared_ptr<CycleClock> cycle_clock_;   // null: feed pacing only
+    int cycles_per_command_ = 6;
+    CyclePhaseTracker phase_;       // kept across streams: the send path's phase does not reset
+    bool cycles_warned_ = false;    // the last stream started without cycles
 
     // Current execution state
     State state_;

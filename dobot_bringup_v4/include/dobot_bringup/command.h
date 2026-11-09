@@ -227,7 +227,8 @@ public:
     // Thread-safe, low-overhead command send for servo streaming.
     // Uses dash_mutex_ to serialise with callRosService calls.
     // Suppresses per-command INFO logging to avoid flooding at 50 Hz.
-    bool sendServoCommand(const std::string &cmd, int32_t &err_id);
+    // queue: if given, the queue number of the reply "0,{N},..." (0 if none).
+    bool sendServoCommand(const std::string &cmd, int32_t &err_id, uint64_t *queue = nullptr);
 
 private:
     std::mutex dash_mutex_;  // guards dashboard TCP access (service calls + servo streaming)
