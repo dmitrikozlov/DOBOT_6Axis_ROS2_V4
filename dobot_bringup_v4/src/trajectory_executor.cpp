@@ -258,11 +258,11 @@ void TrajectoryExecutor::loadTrajectory(
     }
 }
 
-void TrajectoryExecutor::start(bool behind_movj)
+void TrajectoryExecutor::start(uint64_t movj_id)
 {
     if (running_)
         return;
-    behind_movj_ = behind_movj;
+    movj_id_ = movj_id;
     halt_requested_ = false;
 
     // Join a previously completed thread before creating a new one.
@@ -482,7 +482,7 @@ void TrajectoryExecutor::servoLoop()
         {
             RealTimeData rd = commander_->getRealData();
             mode = rd.robot_mode;
-            if (mode == 5 || (behind_movj_ && mode == 7))
+            if (mode == 5 || (movj_id_ != 0 && mode == 7))
                 break;
             if (mode == 9 || mode == 11)
             {
@@ -588,6 +588,7 @@ void TrajectoryExecutor::servoLoop()
     double rate_step = 0.0;
     double halt_t = 0.0;
     bool watch_start = true;        // the start-of-stream check: the segment's first trajectory
+    bool behind_movj = movj_id_ != 0;  // holding the first point until the MovJ has run
     // After the last command: arrival on it, then the hold window.
     std::array<double, 6> held{};
     double held_since = 0.0;        // s from the start, when it was sent
@@ -636,6 +637,33 @@ void TrajectoryExecutor::servoLoop()
                 watch_start = false;
                 RCLCPP_INFO(kLogger, "Appended a %.2f s trajectory: the segment continues",
                             total_duration);
+            }
+        }
+
+        // Behind the segment's MovJ, the first point until the feed shows the
+        // controller past it: it drops the ServoJ that arrive while the MovJ
+        // runs (up to ~180 ms), and a trajectory already under way would start
+        // with a jump.
+        if (behind_movj)
+        {
+            uint64_t now_id = commander_->getRealData().currentCommandId;
+            double waited = since_start(std::chrono::steady_clock::now());
+            if (now_id > movj_id_)
+            {
+                behind_movj = false;
+                RCLCPP_INFO(kLogger, "The MovJ ended %.0f ms into the stream", waited * 1e3);
+            }
+            else if (waited > kMovjWaitS)
+            {
+                behind_movj = false;
+                RCLCPP_WARN(kLogger, "The controller is still on command %llu, not past the "
+                            "MovJ (%llu), %.0f ms into the stream: moving on",
+                            static_cast<unsigned long long>(now_id),
+                            static_cast<unsigned long long>(movj_id_), waited * 1e3);
+            }
+            else
+            {
+                base = iteration;
             }
         }
 

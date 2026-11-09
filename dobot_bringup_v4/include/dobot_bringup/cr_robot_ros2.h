@@ -453,7 +453,7 @@ private:
 
     // Waits for ENABLE, then MovJ to the arm's own joints: the start of a new
     // ServoJ segment. Why it failed, or empty.
-    std::string prime();
+    std::string prime(uint64_t &movj_id);
     // Until the realtime feed shows `mode`; false on a timeout, an alarm or shutdown.
     bool waitMode(uint64_t mode, double timeout_s);
 };

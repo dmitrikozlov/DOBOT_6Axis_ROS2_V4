@@ -68,10 +68,11 @@ public:
     static std::string toDriverOrder(const trajectory_msgs::msg::JointTrajectory &traj,
                                      trajectory_msgs::msg::JointTrajectory &out);
 
-    // Start streaming ServoJ commands. behind_movj: a MovJ was just sent, and
-    // the stream may start while the controller runs it (ServoJ queues behind
-    // it); otherwise the stream waits for ENABLE.
-    void start(bool behind_movj = false);
+    // Start streaming ServoJ commands. movj_id: the queue number of a MovJ just
+    // sent; the stream starts while the controller runs it and holds the first
+    // point until the feed shows the controller past it. 0: the stream waits for
+    // ENABLE.
+    void start(uint64_t movj_id = 0);
 
     // Stop streaming and send Dobot Stop(): the arm halts where it is. After
     // the last point has been sent, only the wait for arrival is abandoned.
@@ -148,6 +149,7 @@ public:
                                   const std::array<double, 6> &ctrl_target);
     static constexpr double kStartFaultDeg = 0.05;
     static constexpr double kStartWatchS = 0.5;   // how long into a stream it is checked
+    static constexpr double kMovjWaitS = 1.0;     // longest hold on the first point behind a MovJ
 
     // Arrival: true once every joint's offset from the last point has stayed
     // within its tolerance for kSettleS of feed time.
@@ -180,7 +182,7 @@ private:
     std::vector<double> pending_times_;
     std::vector<std::array<double, 6>> pending_joints_;
     GoalTolerance pending_tol_;
-    bool behind_movj_ = false;           // start(): stream at once behind a MovJ
+    uint64_t movj_id_ = 0;               // start(): the MovJ the stream starts behind
     std::atomic<bool> halt_requested_{false};
     double halt_decel_mm_s2_ = 2000.0;   // tool deceleration of a halt
     mutable std::mutex mutex_;  // guards trajectory data and state_

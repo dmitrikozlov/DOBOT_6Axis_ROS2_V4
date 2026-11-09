@@ -1410,7 +1410,8 @@ bool CRRobotRos2::ServoJ(const std::shared_ptr<dobot_msgs_v4::srv::ServoJ::Reque
     // An idle controller means this ServoJ starts a new segment (see prime()).
     if (commander_->getRealData().robot_mode == 5)
     {
-        std::string why = prime();
+        uint64_t movj_id = 0;
+        std::string why = prime(movj_id);
         if (!why.empty())
         {
             RCLCPP_ERROR(this->get_logger(), "ServoJ: not sent: %s", why.c_str());
@@ -1454,10 +1455,11 @@ bool CRRobotRos2::waitMode(uint64_t mode, double timeout_s)
 }
 
 // Dobot: every ServoJ segment starts with a MovJ to the current position, and
-// the ServoJ follow as soon as its reply arrives (they queue behind it; no wait
-// on the feed). Without it a stream can move every joint toward 0 (alarm 225):
-// after a power-on, a Stop() or an interrupted stream (bench, 2026-10-27).
-std::string CRRobotRos2::prime()
+// the ServoJ follow as soon as its reply arrives. Without it a stream can move
+// every joint toward 0 (alarm 225): after a power-on, a Stop() or an
+// interrupted stream (bench, 2026-10-27). movj_id: its queue number, which the
+// stream holds its first point behind (TrajectoryExecutor::start).
+std::string CRRobotRos2::prime(uint64_t &movj_id)
 {
     auto mode = [this]() { return std::to_string(commander_->getRealData().robot_mode); };
     if (!waitMode(5, 10.0))
@@ -1469,8 +1471,10 @@ std::string CRRobotRos2::prime()
                   q[0], q[1], q[2], q[3], q[4], q[5]);
     RCLCPP_INFO(this->get_logger(), "New ServoJ segment: %s", cmd);
     int32_t err = 0;
-    if (!commander_->callRosService(cmd, err) || err != 0)
+    std::string queued;   // "{queue number}"
+    if (!commander_->callRosService_f(cmd, err, queued) || err != 0)
         return "the MovJ to the current joints failed (" + std::to_string(err) + ")";
+    movj_id = queued.size() > 1 ? std::strtoull(queued.c_str() + 1, nullptr, 10) : 0;
     return "";
 }
 
@@ -1630,7 +1634,8 @@ void CRRobotRos2::executeTrajectory(
     else
     {
         // A new ServoJ segment (see prime()).
-        why = prime();
+        uint64_t movj_id = 0;
+        why = prime(movj_id);
         if (!why.empty())
         {
             abortWith(result->PATH_TOLERANCE_VIOLATED, "could not start the stream: " + why);
@@ -1638,7 +1643,7 @@ void CRRobotRos2::executeTrajectory(
         }
         // Load and start, right behind the MovJ.
         trajectory_executor_->loadTrajectory(trajectory, tolerance);
-        trajectory_executor_->start(true);
+        trajectory_executor_->start(movj_id);
     }
 
     // Monitor loop: publish feedback; a cancel halts along the path and the
