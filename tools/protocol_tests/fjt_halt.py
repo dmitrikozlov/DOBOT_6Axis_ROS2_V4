@@ -19,6 +19,10 @@ driver. J1 turns by at most --max-deg each way.
 
     ROS_DOMAIN_ID=77 python3 fjt_halt.py --speeds 20,40,60
     ROS_DOMAIN_ID=77 python3 fjt_halt.py --speeds 20,40,60 --line 0,0,1
+
+With --stop the cancel goes with a Stop service call at once, as drover's Stop
+button sends them; back_deg is how far J1 came back from its furthest point
+after the cancel (a snap-back).
 """
 import argparse
 import math
@@ -31,7 +35,7 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
-from dobot_msgs_v4.srv import GetPose, InverseKin
+from dobot_msgs_v4.srv import GetPose, InverseKin, Stop
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
@@ -159,6 +163,9 @@ def run(node, client, rt, args, v):
     wall_cancel = time.time()        # the driver's log uses the same clock
     if not args.no_cancel:
         c = handle.cancel_goal_async()
+        if args.stop:
+            stop = args.stop_client.call_async(Stop.Request())
+            rclpy.spin_until_future_complete(node, stop, timeout_sec=5.0)
         rclpy.spin_until_future_complete(node, c, timeout_sec=5.0)
     rclpy.spin_until_future_complete(node, r, timeout_sec=30.0)
     res = r.result()
@@ -185,7 +192,12 @@ def run(node, client, rt, args, v):
         if t >= t_cancel:
             v_at = math.sqrt(sum(c * c for c in p['tcp_speed_actual'][:3]))
             break
+    # J1 past where it ends, in the move's direction, after the cancel (J1 moves only).
+    after = [p['q_actual'][0] for t, p in packets if t >= t_cancel]
+    back_deg = None if args.line_u else max(
+        (args.sign * (q - after[-1]) for q in after), default=0.0)
     return {'speed': v, 'radius_mm': round(radius, 1), 'status': res.status,
+            'back_deg': back_deg if back_deg is None else round(back_deg, 3),
             'message': res.result.error_string, 'tool_mm_s_at_cancel': round(v_at or 0, 1),
             'travel_mm': round(s_final - (s_cancel or 0), 3),
             'stop_ms': round((path[i_still][0] - t_cancel) * 1e3, 1),
@@ -224,6 +236,8 @@ def main():
     p.add_argument('--max-mm', type=float, default=60.0, help='longest line, mm')
     p.add_argument('--no-cancel', action='store_true',
                    help='let each move run to its end (for its smoothness, not a halt)')
+    p.add_argument('--stop', action='store_true',
+                   help='call the Stop service with each cancel, as drover does')
     p.add_argument('--yes', action='store_true')
     args = p.parse_args()
     speeds = [float(v) for v in args.speeds.split(',')]
@@ -258,6 +272,9 @@ def main():
         raise SystemExit('no FJT server')
     args.getpose = node.create_client(GetPose, '/dobot_bringup_ros2/srv/GetPose')
     args.ik = node.create_client(InverseKin, '/dobot_bringup_ros2/srv/InverseKin')
+    args.stop_client = node.create_client(Stop, '/dobot_bringup_ros2/srv/Stop')
+    if args.stop and not args.stop_client.wait_for_service(timeout_sec=5):
+        raise SystemExit('no Stop service')
     if args.line_u and not (args.getpose.wait_for_service(timeout_sec=5)
                             and args.ik.wait_for_service(timeout_sec=5)):
         raise SystemExit('no GetPose / InverseKin service')
@@ -276,11 +293,12 @@ def main():
             if code != 0:
                 print('the return failed (%s); stopping' % code)
                 break
-    print('\nspeed  tool at cancel  travel mm  still ms  result')
+    print('\nspeed  tool at cancel  travel mm  still ms  back deg  result')
     for row in rows:
-        print('%5g  %14s  %9.2f  %8.0f  %s' % (row['speed'], row.get('tool_mm_s_at_cancel'),
-                                                row.get('travel_mm', -1), row.get('stop_ms', -1),
-                                                row.get('message', row.get('error'))))
+        print('%5g  %14s  %9.2f  %8.0f  %8s  %s' % (row['speed'], row.get('tool_mm_s_at_cancel'),
+                                                     row.get('travel_mm', -1), row.get('stop_ms', -1),
+                                                     row.get('back_deg'),
+                                                     row.get('message', row.get('error'))))
     node.destroy_node()
     rclpy.shutdown()
     rt.stop()

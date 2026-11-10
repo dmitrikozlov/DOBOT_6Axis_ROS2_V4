@@ -140,9 +140,9 @@ MoveIt (plan_only)
    held point continues the same ServoJ segment from the next period: no MovJ, the command
    rhythm unbroken (Dobot: a ServoJ while the controller is RUNNING continues its segment only
    if the interval stays the same). Otherwise the hold ends, the controller's servo mode runs
-   out (~1.7 s), and the next goal starts a new segment with its MovJ. A MovJ, MovL or Stop
-   service call ends the hold first: the controller would otherwise keep a MovJ or MovL back
-   until the servo mode ends. A halt is held the same way, so a retract can follow it at once.
+   out (~1.7 s), and the next goal starts a new segment with its MovJ. A MovJ or MovL service
+   call ends the hold first: the controller would otherwise keep it back until the servo mode
+   ends. A halt is held the same way, so a retract can follow it at once.
 6. The action server publishes feedback at 20 Hz (stamped; desired/actual/error positions and
    velocities in radians; `time_from_start` the trajectory time of the latest command). It reports
    success only once the arm has arrived; `GOAL_TOLERANCE_VIOLATED` if it does not arrive in
@@ -155,6 +155,12 @@ MoveIt (plan_only)
    sent, and a cancel while waiting for arrival ends the wait. On the bench a halt at
    2000 mm/s² stopped the tool ~2.4 mm past the cancel at 40 mm/s, where `Stop()` took ~6 mm
    (t23, 2026-10-27). `Stop()` stays for aborts: a stale feed, a shutdown.
+7. The Stop service while a stream runs does what a cancel does and sends no `Stop()`: a
+   stream halts along its path, a hold ends. Without a stream (a MovJ or MovL, or nothing
+   moving) it sends the controller's `Stop()` as before. A client's cancel and Stop together
+   make one halt. The controller's `Stop()` mid-stream ramps the arm down over ~250 ms and
+   holds the dashboard for ~0.7 s; the stream's commands queued behind it then went out and
+   pulled the arm back by up to ~1.5° (drover's Stop button, 2026-11-10).
 
 ## Thread Safety
 
@@ -218,7 +224,8 @@ Start with defaults. If the robot oscillates or is jerky, reduce `servo_gain`. I
 
 All existing functionality is preserved:
 
-- ROS services (MovJ, MovL, ServoJ, EnableRobot, ClearError, Stop, etc.)
+- ROS services (MovJ, MovL, ServoJ, EnableRobot, ClearError, Stop, etc.); Stop during a
+  stream halts it instead (Execution, 7)
 - Joint state publishing
 - Robot status publishing
 - Real-time feedback topic

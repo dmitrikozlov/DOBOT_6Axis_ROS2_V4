@@ -367,6 +367,16 @@ void TrajectoryExecutor::endHold()
         stop();      // settling: no Stop(), only the end of the stream
 }
 
+bool TrajectoryExecutor::stopStream()
+{
+    if (!running_)
+        return false;
+    endHold();
+    // Still running: streaming, or a trajectory appended to the hold meanwhile.
+    halt();
+    return true;
+}
+
 bool TrajectoryExecutor::isRunning() const
 {
     return running_;

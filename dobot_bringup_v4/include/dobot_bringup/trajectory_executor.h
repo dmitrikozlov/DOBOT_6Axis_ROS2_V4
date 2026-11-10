@@ -108,6 +108,11 @@ public:
     std::array<double, 6> heldPoint() const;
     // Stop holding: the stream ends without Stop(), the arm being at rest.
     void endHold();
+    // The Stop service while a stream runs: a hold ends, a stream halts along
+    // its path (halt()); no Stop(), which would hold the dashboard for ~0.7 s
+    // and leave the stream's queued commands to pull the arm back. False if no
+    // stream runs: the caller sends Stop().
+    bool stopStream();
 
     // How much the trajectory's time rate (1 = as planned) falls per period in
     // a halt from tool_speed (mm/s) at decel (mm/s^2): to 0 over

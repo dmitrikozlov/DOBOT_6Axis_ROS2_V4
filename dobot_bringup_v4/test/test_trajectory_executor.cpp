@@ -347,6 +347,12 @@ TEST(TrajectoryExecutorLifecycle, NotRunningByDefault)
     EXPECT_FALSE(exec->isRunning());
 }
 
+TEST(TrajectoryExecutorLifecycle, StopWithoutAStreamIsTheCallersStop)
+{
+    auto exec = makeExecutor();
+    EXPECT_FALSE(exec->stopStream());   // the Stop service then sends Stop()
+}
+
 TEST(TrajectoryExecutorLifecycle, StartEmptyTrajectoryMarksDone)
 {
     auto exec = makeExecutor();

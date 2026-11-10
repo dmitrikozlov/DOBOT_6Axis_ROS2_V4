@@ -864,7 +864,14 @@ bool CRRobotRos2::RunScript(const std::shared_ptr<dobot_msgs_v4::srv::RunScript:
 
 bool CRRobotRos2::Stop(const std::shared_ptr<dobot_msgs_v4::srv::Stop::Request> request, const std::shared_ptr<dobot_msgs_v4::srv::Stop::Response> response)
 {
-    trajectory_executor_->endHold();
+    // A ServoJ stream halts along its path instead of the controller's Stop()
+    // (TrajectoryExecutor::stopStream); a MovJ or MovL gets Stop().
+    if (trajectory_executor_->stopStream())
+    {
+        RCLCPP_INFO(this->get_logger(), "Stop: the ServoJ stream halts along its path; no Stop() sent");
+        response->res = 0;
+        return true;
+    }
     return commander_->callRosService(parseTool::parserstopRequest2String(request), response->res);
 }
 
