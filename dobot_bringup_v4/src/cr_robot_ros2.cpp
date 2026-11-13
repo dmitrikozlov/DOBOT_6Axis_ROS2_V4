@@ -1477,14 +1477,36 @@ bool CRRobotRos2::waitMode(uint64_t mode, double timeout_s)
 // Dobot: every ServoJ segment starts with a MovJ to the current position, and
 // the ServoJ follow as soon as its reply arrives. Without it a stream can move
 // every joint toward 0 (alarm 225): after a power-on, a Stop() or an
-// interrupted stream (bench, 2026-10-27). movj_id: its queue number, which the
-// stream holds its first point behind (TrajectoryExecutor::start).
+// interrupted stream (bench, 2026-10-27). The first segment of each controller
+// boot is preceded by DisableRobot() + EnableRobot() (controller_boot.h).
+// movj_id: the MovJ's queue number, which the stream holds its first point
+// behind (TrajectoryExecutor::start).
 std::string CRRobotRos2::prime(uint64_t &movj_id)
 {
     auto mode = [this]() { return std::to_string(commander_->getRealData().robot_mode); };
     if (!waitMode(5, 10.0))
         return "the arm is not in ENABLE (robot mode " + mode() + ")";
     RealTimeData rd = commander_->getRealData();
+    auto now_s = [] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    if (controller_boot_.isNew(rd.run_time, now_s()))
+    {
+        RCLCPP_INFO(this->get_logger(), "First ServoJ segment of this controller boot (up %llu s): "
+                    "DisableRobot() + EnableRobot() first",
+                    static_cast<unsigned long long>(rd.run_time));
+        int32_t res = 0;
+        if (!commander_->callRosService("DisableRobot()", res) || res != 0)
+            return "DisableRobot() failed (" + std::to_string(res) + ")";
+        if (!waitMode(4, 5.0))
+            return "the arm did not disable (robot mode " + mode() + ")";
+        if (!commander_->callRosService("EnableRobot()", res) || res != 0)
+            return "EnableRobot() failed (" + std::to_string(res) + ")";
+        if (!waitMode(5, 10.0))
+            return "the arm did not enable again (robot mode " + mode() + ")";
+        rd = commander_->getRealData();
+        controller_boot_.mark(rd.run_time, now_s());
+    }
     const auto &q = rd.q_actual;
     char cmd[160];
     std::snprintf(cmd, sizeof(cmd), "MovJ(joint={%.4f,%.4f,%.4f,%.4f,%.4f,%.4f},a=20,v=5)",

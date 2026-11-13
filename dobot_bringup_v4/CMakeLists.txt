@@ -94,6 +94,13 @@ if(BUILD_TESTING)
   # No rclcpp here to bring C++17 (std::optional) with it.
   target_compile_features(test_cycle_clock PRIVATE cxx_std_17)
 
+  ament_add_gtest(test_controller_boot
+    test/test_controller_boot.cpp
+  )
+  target_include_directories(test_controller_boot PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
   ament_add_gtest(test_tcp_reconnect
     test/test_tcp_reconnect.cpp
     src/command.cpp

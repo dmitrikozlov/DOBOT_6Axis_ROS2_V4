@@ -94,6 +94,14 @@ MoveIt (plan_only)
    aborts (`PATH_TOLERANCE_VIOLATED`, "could not start the stream: …") with nothing streamed.
    The `ServoJ` service sends the same MovJ before a ServoJ that finds the controller idle.
 
+   The first segment of each controller boot is preceded by `DisableRobot()` and
+   `EnableRobot()` (`controller_boot.h`): after a power-on with the arm enabled on the pendant
+   or in the app, a stream moved every joint toward 0° even behind the MovJ (2026-11-11), and
+   re-enabling the arm over port 29999 prevented that (2 of 2, 2026-10-27). A boot is told
+   apart by its start time, the driver's clock minus the feed's `run_time`. The driver only
+   re-enables an arm that is already in ENABLE; one that is disabled stays as it is and the goal
+   aborts as before.
+
 3. `TrajectoryExecutor::loadTrajectory()` converts radians to degrees and stores the waypoints.
 4. `servoLoop()` runs in a dedicated thread:
    - Takes its slot's trajectory time (command index × command period).

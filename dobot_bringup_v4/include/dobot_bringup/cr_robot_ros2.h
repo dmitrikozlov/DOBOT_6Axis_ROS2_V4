@@ -19,6 +19,7 @@
 #include <string>
 #include <memory>
 #include <dobot_bringup/parseTool.h>
+#include <dobot_bringup/controller_boot.h>
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <rclcpp_action/create_server.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -451,9 +452,11 @@ private:
     double goal_tolerance_deg_ = 0.01;     // arrival, for joints the goal leaves at 0
     double goal_time_tolerance_ = 1.0;     // s after the last point, if the goal gives none
 
-    // Waits for ENABLE, then MovJ to the arm's own joints: the start of a new
-    // ServoJ segment. Why it failed, or empty.
+    // Waits for ENABLE, disables and enables the arm once per controller boot,
+    // then MovJ to the arm's own joints: the start of a new ServoJ segment.
+    // Why it failed, or empty.
     std::string prime(uint64_t &movj_id);
+    ControllerBoot controller_boot_;       // the boot prime() last re-enabled the arm in
     // Until the realtime feed shows `mode`; false on a timeout, an alarm or shutdown.
     bool waitMode(uint64_t mode, double timeout_s);
 };
