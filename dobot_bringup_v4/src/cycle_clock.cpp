@@ -16,7 +16,7 @@
 
 namespace
 {
-const char kMark[] = "[ch8]";
+const char kMark[] = "\n1:";          // a block's first line is field 1
 constexpr size_t kMarkLen = sizeof(kMark) - 1;
 const char kField84[] = "\n84:";
 constexpr size_t kMaxText = 1 << 20;        // a block is a few kB; past this the stream is not blocks
@@ -171,6 +171,8 @@ void CycleClock::onData(const char *data, size_t n, Clock::time_point t)
                     it = it->first + kKeepTaken < newest_queue_ ? taken_.erase(it) : std::next(it);
             }
         }
+        if (marks && !times_.empty() && t - times_.back() > kAlive)
+            times_.clear();
         for (size_t i = 0; i < marks; i++)
             times_.push_back(t);
         while (times_.size() > kKeepTimes)
@@ -183,7 +185,7 @@ void CycleClock::onData(const char *data, size_t n, Clock::time_point t)
 bool CycleClock::alive() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return !times_.empty() && Clock::now() - times_.back() < kAlive;
+    return times_.size() >= kMinBlocks && Clock::now() - times_.back() < kAlive;
 }
 
 uint64_t CycleClock::count() const
@@ -211,6 +213,39 @@ CycleClock::Clock::time_point CycleClock::arrival(uint64_t k) const
     return times_[times_.size() - 1 - back];
 }
 
+CycleClock::Clock::time_point CycleClock::base() const
+{
+    const auto cycle = std::chrono::nanoseconds(static_cast<int64_t>(kCycleS * 1e9));
+    const size_t n = std::min(times_.size(), kBaseBlocks);
+    Clock::time_point earliest = Clock::time_point::max();
+    for (size_t i = times_.size() - n; i < times_.size(); i++)
+    {
+        uint64_t k = count_ - (times_.size() - 1 - i);
+        earliest = std::min(earliest, times_[i] - cycle * static_cast<int64_t>(k));
+    }
+    return earliest;
+}
+
+CycleClock::Clock::time_point CycleClock::due(uint64_t k) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (times_.empty())
+        return Clock::now();
+    return base() + std::chrono::nanoseconds(static_cast<int64_t>(kCycleS * 1e9)) *
+                        static_cast<int64_t>(k);
+}
+
+uint64_t CycleClock::dueAt(Clock::time_point t) const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (times_.empty())
+        return count_;
+    auto since = t - base();
+    if (since.count() < 0)
+        return 0;
+    return static_cast<uint64_t>(since / std::chrono::nanoseconds(static_cast<int64_t>(kCycleS * 1e9)));
+}
+
 std::optional<uint64_t> CycleClock::takenIn(uint64_t queue) const
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -220,50 +255,119 @@ std::optional<uint64_t> CycleClock::takenIn(uint64_t queue) const
     return it->second;
 }
 
-void CyclePhaseTracker::sent(uint64_t queue, uint64_t block)
+void CyclePhaseTracker::probed(uint64_t queue, uint64_t block, double phase_ms)
 {
-    sent_.push_back({queue, block, std::nullopt});
-    while (sent_.size() > 64)
-        sent_.pop_front();
+    probes_.push_back({queue, block, phase_ms, std::nullopt});
+    while (probes_.size() > kProbesKept)
+        probes_.pop_front();
 }
 
-double CyclePhaseTracker::update(const std::function<std::optional<uint64_t>(uint64_t)> &taken_in)
+double CyclePhaseTracker::nextProbeMs()
 {
-    std::map<int64_t, size_t> seen;
-    for (Sent &s : sent_)
+    const double cycle_ms = CycleClock::kCycleS * 1000.0;
+    double ms = (probe_next_ + 0.5) * cycle_ms / kProbePhases;
+    probe_next_ = (probe_next_ + 1) % kProbePhases;
+    return ms;
+}
+
+std::optional<CyclePhaseTracker::Boundary>
+CyclePhaseTracker::fit(const std::vector<std::pair<double, int64_t>> &samples)
+{
+    const double cycle_ms = CycleClock::kCycleS * 1000.0;
+    if (samples.empty())
+        return std::nullopt;
+    // Phases into [0, cycle): a send a cycle later is one block later.
+    std::vector<std::pair<double, int64_t>> s;
+    for (auto [phase, lag] : samples)
     {
-        if (!s.lag)
+        int64_t whole = static_cast<int64_t>(std::floor(phase / cycle_ms));
+        s.emplace_back(phase - whole * cycle_ms, lag - whole);
+    }
+    // Per candidate boundary b: lag_before for phases below it, one more above.
+    constexpr int kSteps = 80;
+    std::vector<size_t> misfits(kSteps);
+    std::vector<int64_t> before(kSteps);
+    for (int i = 0; i < kSteps; i++)
+    {
+        double b = i * cycle_ms / kSteps;
+        std::map<int64_t, size_t> votes;   // lag_before each sample implies
+        for (auto [phase, lag] : s)
+            votes[phase < b ? lag : lag - 1]++;
+        auto best = std::max_element(votes.begin(), votes.end(),
+                                     [](const auto &x, const auto &y) { return x.second < y.second; });
+        before[i] = best->first;
+        misfits[i] = s.size() - best->second;
+    }
+    // The middle of the longest run of best candidates, around the cycle.
+    size_t fewest = *std::min_element(misfits.begin(), misfits.end());
+    int run_start = 0, run_len = 0;
+    for (int i = 0; i < kSteps; i++)
+    {
+        int len = 0;
+        while (len < kSteps && misfits[(i + len) % kSteps] == fewest)
+            len++;
+        if (len > run_len)
         {
-            if (auto b = taken_in(s.queue))
-                s.lag = static_cast<int64_t>(*b) - static_cast<int64_t>(s.block);
+            run_len = len;
+            run_start = i;
         }
-        if (s.lag)
-            seen[*s.lag]++;
     }
-    size_t n = 0;
-    for (const auto &kv : seen)
-        n += kv.second;
-    if (n >= kBaseline)
-        usual_ = std::max_element(seen.begin(), seen.end(),
-                                  [](const auto &a, const auto &b) { return a.second < b.second; })
-                     ->first;
-    if (!usual_)
-        return delay_ms_;
-    for (const Sent &s : sent_)
+    int mid = (run_start + run_len / 2) % kSteps;
+    double b = mid * cycle_ms / kSteps;
+    // Late take-ups move probes past the boundary, never before it: the latest
+    // probe taken with lag_before was sent before it. Within half a cycle of
+    // b; a probe more than that after b is measured against the next block.
+    double edge = b;
+    bool found = false;
+    for (auto [phase, lag] : s)
     {
-        if (!s.lag || *s.lag == *usual_)
-            continue;
-        double unwrapped = delay_ms_ + (*s.lag > *usual_ ? -kStepMs : kStepMs);
-        const double cycle_ms = CycleClock::kCycleS * 1000.0;
-        delay_ms_ = std::fmod(unwrapped, cycle_ms);
-        if (delay_ms_ < 0.0)
-            delay_ms_ += cycle_ms;
-        // Past 0 or a whole cycle the send moves to the neighbouring block's
-        // cycle, and every take-up delay with it.
-        *usual_ += std::lround((delay_ms_ - unwrapped) / cycle_ms);
-        shifts_++;
-        sent_.clear();
-        break;
+        double rel = phase - b;
+        int64_t l = lag;
+        if (rel >= cycle_ms / 2.0)
+        {
+            rel -= cycle_ms;
+            l -= 1;
+        }
+        else if (rel < -cycle_ms / 2.0)
+        {
+            rel += cycle_ms;
+            l += 1;
+        }
+        if (l == before[mid] && (!found || b + rel > edge))
+        {
+            edge = b + rel;
+            found = true;
+        }
     }
-    return delay_ms_;
+    double send = std::fmod(edge + kEdgeMarginMs, cycle_ms);
+    if (send < 0.0)
+        send += cycle_ms;
+    return Boundary{b, before[mid], edge, send, s.size(), fewest};
+}
+
+void CyclePhaseTracker::update(const std::function<std::optional<uint64_t>(uint64_t)> &taken_in)
+{
+    for (Probe &p : probes_)
+    {
+        if (!p.lag)
+        {
+            if (auto b = taken_in(p.queue))
+            {
+                p.lag = static_cast<int64_t>(*b) - static_cast<int64_t>(p.block);
+                probes_new_++;
+            }
+        }
+    }
+    if (probes_new_ < kProbesNeeded)
+        return;
+    std::vector<std::pair<double, int64_t>> samples;
+    for (const Probe &p : probes_)
+        if (p.lag)
+            samples.emplace_back(p.phase_ms, *p.lag);
+    probes_new_ = 0;
+    if (auto b = fit(samples))
+    {
+        boundary_ = b;
+        measurements_++;
+    }
 }

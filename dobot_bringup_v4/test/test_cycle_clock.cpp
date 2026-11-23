@@ -8,13 +8,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <map>
 #include <string>
 #include <thread>
 
 static std::string block(uint64_t queue)
 {
-    return "[ch8]\n1:0.1\n2:0.2\n84:" + std::to_string(queue) + "\n85:7\n";
+    return "\r\n1:0.1\r\n11:0\r\n84:" + std::to_string(queue) + "\r\n165:10\r\nS1:-1,2,3\r\nS2:-1,2,3";
 }
 
 TEST(CycleBlockParser, CountsBlocksAndReadsField84)
@@ -35,7 +36,7 @@ TEST(CycleBlockParser, CountsBlocksAndReadsField84)
 
 TEST(CycleBlockParser, MarksAndFieldsSplitAcrossChunks)
 {
-    std::string text = block(5) + block(6) + "[ch8]\n84:1\n" + block(8);
+    std::string text = block(5) + block(6) + "\r\n1:0\r\n84:1" + block(8);
     for (size_t chunk = 1; chunk <= 7; chunk++)
     {
         CycleBlockParser p;
@@ -55,7 +56,7 @@ TEST(CycleBlockParser, BlockWithoutField84)
 {
     CycleBlockParser p;
     std::vector<uint64_t> f84;
-    std::string text = "[ch8]\n1:2\n840:9\n[ch8]";
+    std::string text = "\r\n1:2\r\n840:9\r\n1:3";
     EXPECT_EQ(p.feed(text.data(), text.size(), f84), 2u);
     ASSERT_EQ(f84.size(), 1u);
     EXPECT_EQ(f84[0], 0u);
@@ -100,7 +101,7 @@ TEST(CycleClock, ReadsFromASocket)
     listen(srv, 1);
     std::thread server([srv] {
         int fd = accept(srv, nullptr, nullptr);
-        for (uint64_t k = 0; k < 50; k++)
+        for (uint64_t k = 0; k < 300; k++)
         {
             std::string b = block(200 + k / 6);
             send(fd, b.data(), b.size(), 0);
@@ -111,63 +112,132 @@ TEST(CycleClock, ReadsFromASocket)
     CycleClock c("127.0.0.1", ntohs(addr.sin_port));
     c.start();
     EXPECT_NE(c.waitBlock(20, std::chrono::milliseconds(2000)), 0u);
+    EXPECT_FALSE(c.alive());        // too few blocks yet to predict the cycle from
+    EXPECT_NE(c.waitBlock(CycleClock::kMinBlocks + 10, std::chrono::milliseconds(3000)), 0u);
     EXPECT_TRUE(c.alive());
     server.join();
     c.stop();
     close(srv);
-    EXPECT_EQ(c.count(), 50u);
+    EXPECT_EQ(c.count(), 300u);
     EXPECT_EQ(c.takenIn(201).value(), 7u);
 }
 
-// Commands every 6 blocks, taken up `lag` blocks after the one they followed.
-struct FakeController
+TEST(CycleClock, DueIgnoresLateAndBunchedArrivals)
 {
-    std::map<uint64_t, uint64_t> taken;
-    uint64_t queue = 1000, block = 0;
-    void send(CyclePhaseTracker &t, int64_t lag)
+    CycleClock c("127.0.0.1", 1);
+    auto t0 = CycleClock::Clock::now();
+    auto cycle = std::chrono::milliseconds(4);
+    std::string pending;
+    for (uint64_t k = 1; k <= 20; k++)
     {
-        block += 6;
-        t.sent(++queue, block);
-        taken[queue] = block + lag;
+        pending += block(k);
+        if (k == 7)
+            continue;                               // 7 arrives together with 8
+        auto late = k == 5 ? std::chrono::milliseconds(3) : std::chrono::milliseconds(0);
+        c.onData(pending.data(), pending.size(), t0 + cycle * k + late);
+        pending.clear();
     }
-    std::optional<uint64_t> takenIn(uint64_t q) const
-    {
-        auto it = taken.find(q);
-        return it == taken.end() ? std::nullopt : std::optional<uint64_t>(it->second);
-    }
-};
-
-TEST(CyclePhaseTracker, StepsEarlierAfterALateTakeUp)
-{
-    CyclePhaseTracker t;
-    FakeController c;
-    auto taken = [&c](uint64_t q) { return c.takenIn(q); };
-    for (int i = 0; i < 5; i++)
-    {
-        c.send(t, 2);
-        EXPECT_DOUBLE_EQ(t.update(taken), 0.0);
-    }
-    c.send(t, 3);       // a cycle late: near the late edge
-    EXPECT_DOUBLE_EQ(t.update(taken), 3.0);   // 1 ms earlier, wrapped into the cycle before
-    EXPECT_EQ(t.shifts(), 1);
-    // sending in the cycle before, every take-up delay is one more
-    for (int i = 0; i < 5; i++)
-    {
-        c.send(t, 3);
-        EXPECT_DOUBLE_EQ(t.update(taken), 3.0);
-    }
-    c.send(t, 2);       // early: 1 ms later, back across the wrap
-    EXPECT_DOUBLE_EQ(t.update(taken), 0.0);
-    EXPECT_EQ(t.shifts(), 2);
+    EXPECT_EQ(c.count(), 20u);
+    EXPECT_EQ(c.due(7), t0 + cycle * 7);
+    EXPECT_EQ(c.due(26), t0 + cycle * 26);
+    EXPECT_EQ(c.dueAt(t0 + cycle * 26 + std::chrono::milliseconds(1)), 26u);
 }
 
-TEST(CyclePhaseTracker, NoStepBeforeTheBaseline)
+// Taken up in the first block that starts at least lambda_ms after the send:
+// the take-up delay of a send phase_ms after its block.
+static int64_t takeUp(double phase_ms, double lambda_ms)
+{
+    return static_cast<int64_t>(std::ceil((phase_ms + lambda_ms) / 4.0));
+}
+
+TEST(CyclePhaseTracker, FitsTheBoundaryThroughJitter)
+{
+    std::vector<std::pair<double, int64_t>> s;
+    for (int rep = 0; rep < 4; rep++)
+        for (int i = 0; i < 16; i++)
+        {
+            double phase = (i + 0.5) * 0.25;
+            double jitter = 0.3 * ((rep * 7 + i * 3) % 5 - 2) / 2.0;   // -0.3..0.3 ms
+            s.emplace_back(phase, takeUp(phase, 9.0 + jitter));
+        }
+    auto b = CyclePhaseTracker::fit(s);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_NEAR(b->phase_ms, 3.0, 0.3);       // 3 + 9 = 12: a block boundary
+    EXPECT_EQ(b->lag_before, 3);
+    EXPECT_EQ(b->probes, 64u);
+    EXPECT_NEAR(b->edge_ms, 3.0, 0.45);
+}
+
+TEST(CyclePhaseTracker, LateTakeUpsDoNotMoveTheEdge)
+{
+    std::vector<std::pair<double, int64_t>> s;
+    for (int rep = 0; rep < 4; rep++)
+        for (int i = 0; i < 16; i++)
+        {
+            double phase = (i + 0.5) * 0.25;
+            bool late = (rep * 16 + i) % 5 == 0;          // every fifth, 2.5 ms late
+            s.emplace_back(phase, takeUp(phase, late ? 11.5 : 9.0));
+        }
+    auto b = CyclePhaseTracker::fit(s);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_DOUBLE_EQ(b->edge_ms, 2.875);      // the latest probe before 3.0 taken on time
+}
+
+TEST(CyclePhaseTracker, FitTakesPhasesPastTheCycleIntoTheNextBlock)
+{
+    // the same sends, some measured against the block before or after
+    std::vector<std::pair<double, int64_t>> s;
+    for (int i = 0; i < 40; i++)
+    {
+        double phase = i * 0.1;
+        int64_t lag = takeUp(phase, 9.0);
+        if (i % 3 == 0)
+            s.emplace_back(phase + 4.0, lag + 1);   // after the block before
+        else if (i % 3 == 1)
+            s.emplace_back(phase - 4.0, lag - 1);   // after the next block
+        else
+            s.emplace_back(phase, lag);
+    }
+    auto b = CyclePhaseTracker::fit(s);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_NEAR(b->phase_ms, 3.0, 0.15);
+    EXPECT_EQ(b->lag_before, 3);
+    EXPECT_EQ(b->misfits, 0u);
+}
+
+TEST(CyclePhaseTracker, SendPastTheCycleWrapsIntoIt)
+{
+    std::vector<std::pair<double, int64_t>> s;
+    for (int i = 0; i < 16; i++)
+    {
+        double phase = (i + 0.5) * 0.25;
+        s.emplace_back(phase, takeUp(phase, 8.5));      // boundary at 3.5 ms
+    }
+    auto b = CyclePhaseTracker::fit(s);
+    ASSERT_TRUE(b.has_value());
+    EXPECT_DOUBLE_EQ(b->edge_ms, 3.375);
+    EXPECT_DOUBLE_EQ(b->send_ms, 3.375 + CyclePhaseTracker::kEdgeMarginMs - 4.0);
+}
+
+TEST(CyclePhaseTracker, ProbesMeasureWhereMovingCommandsBelong)
 {
     CyclePhaseTracker t;
-    FakeController c;
-    auto taken = [&c](uint64_t q) { return c.takenIn(q); };
-    c.send(t, 2);
-    c.send(t, 3);
-    EXPECT_DOUBLE_EQ(t.update(taken), 0.0);
-    EXPECT_EQ(t.shifts(), 0);
+    std::map<uint64_t, uint64_t> taken;
+    uint64_t queue = 0, block = 0;
+    auto taken_in = [&taken](uint64_t q) {
+        auto it = taken.find(q);
+        return it == taken.end() ? std::nullopt : std::optional<uint64_t>(it->second);
+    };
+    for (size_t i = 0; i < CyclePhaseTracker::kProbesNeeded; i++)
+    {
+        EXPECT_EQ(t.measurements(), 0);
+        block += 6;
+        double phase = t.nextProbeMs();
+        t.probed(++queue, block, phase);
+        taken[queue] = block + takeUp(phase, 9.0);
+        t.update(taken_in);
+    }
+    ASSERT_EQ(t.measurements(), 1);
+    // just after the boundary at 3.0 ms
+    EXPECT_NEAR(t.boundary()->send_ms, 2.875 + CyclePhaseTracker::kEdgeMarginMs, 1e-9);
 }

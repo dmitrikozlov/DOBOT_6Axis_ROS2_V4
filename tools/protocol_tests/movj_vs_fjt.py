@@ -187,7 +187,12 @@ def main():
     rt = dp.RealtimeReader(os.environ.get('DOBOT_IP', dp.DEFAULT_IP))
     rt.start()
     rt.wait_first()
-    q0 = list(rt.current(max_age=0.5)['q_actual'])
+    pkt = rt.current(max_age=0.5)
+    if pkt['robot_mode'] != 5 or any(abs(v) > 0.1 for v in pkt['qd_actual']):
+        # planned from a moving arm, the moves would start wherever it was passing
+        raise SystemExit('the arm must be enabled and still; it is %s, joint speeds up to %.1f deg/s'
+                         % (dp.mode_name(pkt['robot_mode']), max(abs(v) for v in pkt['qd_actual'])))
+    q0 = list(pkt['q_actual'])
     q1 = [a + d for a, d in zip(q0, delta)]
     lead = max(range(6), key=lambda j: abs(delta[j]))
     print('Plan: from [%s] by [%s] deg and back, MovJ at v=%s %% (a=%g %%), then the same as FJT.'
@@ -221,6 +226,8 @@ def main():
         # The FJT moves at the profile the MovJ's leading joint had.
         vmax = sum(m['peak_deg_s'] for _, m in legs) / len(legs)
         amax = sum(m['lead_acc_deg_s2'] for _, m in legs) / len(legs)
+        print('v=%-4g FJT profile: J%d peak %.2f deg/s, acceleration %.1f deg/s2'
+              % (v, lead + 1, vmax, amax), flush=True)
         n_rows = 2
         for profile in args.profiles.split(','):
             for name, qa, qb in (('out', q0, q1), ('back', q1, q0)):

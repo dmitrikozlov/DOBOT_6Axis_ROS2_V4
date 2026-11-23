@@ -16,6 +16,11 @@ Without --accel the stream is Dobot's: a constant step, speed x period, from
 the first command (their test: --delta 100,0,100 at 31.4 mm/s, 100 commands).
 With --accel the speed ramps up and down (half-cosine) at that acceleration.
 
+With --joint-delta (deg per joint) and --mode servoj, the move is a joint move
+from --start-joints streamed as ServoJ with the same loop; --speed and --accel
+are then the leading joint's deg/s and deg/s^2, all joints finishing together
+(as movj_vs_fjt.py's FJT goals, whose profile it prints).
+
 Writes <out>/<leg>.csv per leg: each command's send and reply times
 (perf_counter, s) and the reply. The motion itself is measured separately, on
 the controller's ports, by whatever records them (rec_ports.py on the Pi).
@@ -24,6 +29,8 @@ the controller's ports, by whatever records them (rec_ports.py on the Pi).
     python servop_ref.py --start-joints -90,40,-87,-25,91,0 --reps 3
     python servop_ref.py --start-joints ... --delta 300,0,0 --speed 150 --accel 600
     python servop_ref.py --start-joints ... --delta 300,0,0 --mode movl --speed 150 --a 30
+    python servop_ref.py --start-joints ... --joint-delta 160,-8,12,30,-30,30 --mode servoj \
+        --speed 38.6 --accel 98 --reps 2
 """
 import argparse
 import csv
@@ -94,18 +101,18 @@ def wait_idle(dash, timeout=30.0):
     raise SystemExit('the arm did not come to rest in %.0f s' % timeout)
 
 
-def stream(dash, p0, p1, fractions, args):
-    """Dobot's loop: ServoP, then perf_counter until the period is up."""
+def stream(send, p0, p1, fractions, args):
+    """Dobot's loop: ServoP (or ServoJ), then perf_counter until the period is up."""
     rows = []
     for k, f in enumerate(fractions):
         a = time.perf_counter()
         target = [u + (v - u) * f for u, v in zip(p0, p1)]
-        raw = dash.ServoP(*target, t=args.t)
+        raw = send(*target, t=args.t, aheadtime=args.aheadtime, gain=args.gain)
         b = time.perf_counter()
         rows.append({'k': k, 'fraction': '%.6f' % f, 't_send': '%.6f' % a,
                      't_reply': '%.6f' % b, 'reply': raw.strip()})
         if reply_values(raw)[0] != 0:
-            raise SystemExit('ServoP rejected: %s' % raw)
+            raise SystemExit('Servo command rejected: %s' % raw)
         remaining = args.period - (b - a)
         if remaining > 0.01:
             time.sleep(remaining * 0.5)
@@ -119,12 +126,17 @@ def main():
     p.add_argument('--ip', default='192.168.5.1')
     p.add_argument('--start-joints', required=True, type=floats, help='deg, j1..j6')
     p.add_argument('--delta', default='100,0,100', type=floats, help='mm, x,y,z')
-    p.add_argument('--mode', choices=('servop', 'movl', 'movj'), default='servop')
+    p.add_argument('--joint-delta', type=floats, help='deg, j1..j6: a joint move (--mode servoj)')
+    p.add_argument('--mode', choices=('servop', 'servoj', 'movl', 'movj'), default='servop')
     p.add_argument('--speed', type=float, default=1000 * math.sqrt(2) / 45,
                    help='mm/s (default: Dobot\'s, 1.41 mm per 45 ms)')
     p.add_argument('--accel', type=float, default=0.0, help='mm/s^2; 0: no ramps (Dobot\'s)')
     p.add_argument('--period', type=float, default=0.045, help='s between ServoP')
     p.add_argument('--t', type=float, default=0.05, help='ServoP t, s')
+    p.add_argument('--aheadtime', type=float, default=-1.0,
+                   help='ServoP/ServoJ aheadtime [20..100]; -1: not sent, the controller\'s 50 (Dobot\'s)')
+    p.add_argument('--gain', type=float, default=-1.0,
+                   help='ServoP/ServoJ gain [200..1000]; -1: not sent, the controller\'s 500 (Dobot\'s)')
     p.add_argument('--a', type=int, default=20, help='movl/movj acceleration, %%')
     p.add_argument('--v', type=int, default=20, help='movj speed, %%')
     p.add_argument('--hold', type=float, default=0.3,
@@ -138,9 +150,17 @@ def main():
     args = p.parse_args()
     if len(args.start_joints) != 6 or len(args.delta) != 3:
         raise SystemExit('--start-joints takes 6 values, --delta 3')
-    distance = math.sqrt(sum(d * d for d in args.delta))
-    if args.speed > 250:
-        raise SystemExit('over 250 mm/s, the safety level\'s tool speed')
+    joints = args.mode == 'servoj'
+    if joints != (args.joint_delta is not None) or (joints and len(args.joint_delta) != 6):
+        raise SystemExit('--mode servoj takes --joint-delta, 6 values, and only it does')
+    if joints:
+        distance = max(abs(d) for d in args.joint_delta)
+        if args.speed > 150:
+            raise SystemExit('over 150 deg/s on the leading joint')
+    else:
+        distance = math.sqrt(sum(d * d for d in args.delta))
+        if args.speed > 250:
+            raise SystemExit('over 250 mm/s, the safety level\'s tool speed')
 
     if args.cpu >= 0:
         try:
@@ -153,16 +173,22 @@ def main():
 
     fractions = profile(distance, args.speed, args.accel, args.period)
     hold = [0.0] * round(args.hold / args.period)
-    if args.mode == 'servop':
-        plan = ('ServoP every %.1f ms, t=%.3f, %d commands per leg (%.1f s), peak %.1f mm/s'
-                % (args.period * 1e3, args.t, len(fractions), len(fractions) * args.period,
-                   max(b - a for a, b in zip([0] + fractions, fractions)) * distance / args.period))
+    if args.mode in ('servop', 'servoj'):
+        plan = ('%s every %.1f ms, t=%.3f, aheadtime %s, gain %s, %d commands per leg (%.1f s), '
+                'peak %.1f %s'
+                % ('ServoJ' if joints else 'ServoP', args.period * 1e3, args.t,
+                   '%g' % args.aheadtime if args.aheadtime > 0 else 'default',
+                   '%g' % args.gain if args.gain > 0 else 'default', len(fractions),
+                   len(fractions) * args.period,
+                   max(b - a for a, b in zip([0] + fractions, fractions)) * distance / args.period,
+                   'deg/s' if joints else 'mm/s'))
     else:
         plan = '%s, %s' % (args.mode, 'speed=%g mm/s a=%d%%' % (args.speed, args.a)
                            if args.mode == 'movl' else 'v=%d%% a=%d%%' % (args.v, args.a))
-    print('Plan: MovJ to [%s], then [%s] mm out and back, %d times. %s.'
+    print('Plan: MovJ to [%s], then [%s] %s out and back, %d times. %s.'
           % (','.join('%g' % v for v in args.start_joints),
-             ','.join('%g' % v for v in args.delta), args.reps, plan))
+             ','.join('%g' % v for v in (args.joint_delta if joints else args.delta)),
+             'deg' if joints else 'mm', args.reps, plan))
     print('Results: %s' % args.out)
     if not args.yes and input('Type yes to move the arm: ').strip() != 'yes':
         return
@@ -171,19 +197,24 @@ def main():
         dash.MovJ(*args.start_joints, 1, a=20, v=10)
         wait_idle(dash)
         time.sleep(1.0)
-        err, p0 = reply_values(dash.GetPose())
-        p1 = [v + d for v, d in zip(p0, args.delta + [0, 0, 0])]
+        if joints:
+            err, p0 = reply_values(dash.GetAngle())
+            p1 = [v + d for v, d in zip(p0, args.joint_delta)]
+        else:
+            err, p0 = reply_values(dash.GetPose())
+            p1 = [v + d for v, d in zip(p0, args.delta + [0, 0, 0])]
         for leg, a, b in (('out', p0, p1), ('back', p1, p0)):
             name = '%s_%d' % (leg, rep + 1)
-            if args.mode == 'servop':
+            if args.mode in ('servop', 'servoj'):
                 # a MovJ to the arm's own joints straight before the stream: without it, a
                 # stream after an idle wait can plan every joint toward 0 (alarm 225)
                 err, q = reply_values(dash.GetAngle())
                 dash.MovJ(*q, 1, a=20, v=5)
-                rows = stream(dash, a, b, hold + fractions, args)
+                rows = stream(dash.ServoJ if joints else dash.ServoP, a, b, hold + fractions, args)
                 iv = [float(y['t_send']) - float(x['t_send']) for x, y in zip(rows, rows[1:])]
-                print('%s: %d ServoP, interval %.3f ms mean, %.3f..%.3f ms' % (
-                    name, len(rows), 1e3 * sum(iv) / len(iv), 1e3 * min(iv), 1e3 * max(iv)))
+                print('%s: %d %s, interval %.3f ms mean, %.3f..%.3f ms' % (
+                    name, len(rows), 'ServoJ' if joints else 'ServoP',
+                    1e3 * sum(iv) / len(iv), 1e3 * min(iv), 1e3 * max(iv)))
             else:
                 t0 = time.perf_counter()
                 raw = (dash.MovL(*b, 0, a=args.a, speed=int(args.speed)) if args.mode == 'movl'

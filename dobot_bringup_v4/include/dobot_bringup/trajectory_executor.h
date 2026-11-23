@@ -54,8 +54,10 @@ public:
     // Pace on the controller's 4 ms motion cycle instead (cycle_clock.h): a
     // ServoJ every cycles_per_command cycles, t = cycles_per_command x 4 ms. A
     // stream that starts while the clock has no blocks paces on the feed, and
-    // one that loses them continues on the feed with the same t.
-    void setCycleClock(std::shared_ptr<CycleClock> clock, int cycles_per_command);
+    // one that loses them continues on the feed with the same t. Moving
+    // commands go send_ms after their cycle's block, in [0, 4).
+    void setCycleClock(std::shared_ptr<CycleClock> clock, int cycles_per_command,
+                       double send_ms);
 
     // Load a new trajectory.  Stops current execution if running.
     // Joint positions must be in radians (ROS convention) and in the order of
@@ -211,7 +213,8 @@ private:
     int rt_priority_;               // SCHED_FIFO priority of the servo thread; 0: none
     std::shared_ptr<CycleClock> cycle_clock_;   // null: feed pacing only
     int cycles_per_command_ = 6;
-    CyclePhaseTracker phase_;       // kept across streams: the send path's phase does not reset
+    double send_ms_ = 0.0;          // moving commands: this long after their cycle's block
+    CyclePhaseTracker phase_;       // probes kept across streams
     bool cycles_warned_ = false;    // the last stream started without cycles
 
     // Current execution state

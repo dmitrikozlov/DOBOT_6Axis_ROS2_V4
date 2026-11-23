@@ -24,7 +24,7 @@ divisor, if it runs on one.
 
 With --cycles N the ServoJ go out right after every N-th block of the
 controller's log port 65511, with t = N x 4 ms: the controller's motion module
-logs one [ch8] block per 4 ms cycle and takes ServoJ on that grid, dividing
+logs one block per 4 ms cycle and takes ServoJ on that grid, dividing
 each step by min(t, the gap in whole cycles), so commands must arrive exactly N
 cycles apart for the target speed to stay even. With --track-phase as well,
 field 84 of each block (the queue number being executed) shows the cycle each
@@ -51,7 +51,7 @@ import time
 
 import dobot_proto as dp
 
-ALGS_LOG_PORT = 65511    # the controller's motion-module log: one [ch8] block per cycle
+ALGS_LOG_PORT = 65511    # the controller's motion-module log: one block per cycle
 ALGS_CYCLE = 0.004       # s
 EXECUTING = re.compile(rb'\n84:(\d+)')   # field 84 of a block: the queue number being executed
 PHASE_STEP_MS = 1.0      # a step away from the edge a command was taken up beyond
@@ -60,7 +60,7 @@ CLOCK_DRIFT = 1e-4       # the fitted cycle clock may run this much late per s (
 
 
 class CycleClock(threading.Thread):
-    """Counts the [ch8] blocks on port 65511, keeping each one's arrival time
+    """Counts the blocks on port 65511, keeping each one's arrival time
     (host monotonic), so commands can be sent on the controller's own cycle.
     Field 84 of a block is the queue number the controller is executing:
     taken[n] is the first block (1-based, as count) in which n appears.
@@ -68,7 +68,7 @@ class CycleClock(threading.Thread):
     base + k x 4 ms, base the smallest arrival - k x 4 ms seen, which may rise by
     CLOCK_DRIFT so that the two clocks drifting apart is not read as lateness."""
 
-    MARK = b'[ch8]'
+    MARK = b'\n1:'      # a block's first line is field 1
 
     def __init__(self, ip):
         super().__init__(daemon=True)
@@ -380,7 +380,7 @@ def main():
         c0, t0 = cycles.count, dp.now()
         time.sleep(2.0)
         if cycles.count - c0 < 100:
-            raise SystemExit('port %d gave %d [ch8] blocks in 2 s: no cycle to pace on'
+            raise SystemExit('port %d gave %d blocks in 2 s: no cycle to pace on'
                              % (ALGS_LOG_PORT, cycles.count - c0))
         period = args.cycles * ALGS_CYCLE
         s.log('feed period %.4f ms; motion-module cycle %.4f ms (port %d); a ServoJ every %d '

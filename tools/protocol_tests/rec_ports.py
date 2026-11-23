@@ -3,7 +3,7 @@
 
 Writes to --out until SIGINT/SIGTERM: realtime.csv (every port 30004 packet,
 as in the tests), and for each log port (default 65511, the motion module's
-4 ms [ch8] blocks) <port>.raw, the bytes as received, with <port>.idx, the
+4 ms blocks) <port>.raw, the bytes as received, with <port>.idx, the
 receive time and byte offset of each chunk. Times are this computer's
 monotonic clock, as in imu_record.py.
 

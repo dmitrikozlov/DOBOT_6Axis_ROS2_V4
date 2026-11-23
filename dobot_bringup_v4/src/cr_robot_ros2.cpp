@@ -344,12 +344,18 @@ kServiceEnableFTSensor = this->create_service<dobot_msgs_v4::srv::EnableFTSensor
     // 65511 (cycle_clock.h); without the port, on the feed as above.
     this->declare_parameter("servo_cycle_tracking", true);
     this->declare_parameter("servo_cycles_per_command", 6);
+    // Moving commands this long after their cycle's block: 0.75 ms after the
+    // latest send the controller still takes in the earlier cycle (1.95 ms on
+    // 2026-11-20 and after a power cycle on 2026-11-23). Holds measure it again
+    // and warn when it differs by over 0.5 ms.
+    this->declare_parameter("servo_send_ms", 2.7);
     if (this->get_parameter("servo_cycle_tracking").as_bool())
     {
         auto cycles = std::make_shared<CycleClock>(robotIp);
         cycles->start();
         trajectory_executor_->setCycleClock(
-            cycles, static_cast<int>(this->get_parameter("servo_cycles_per_command").as_int()));
+            cycles, static_cast<int>(this->get_parameter("servo_cycles_per_command").as_int()),
+            this->get_parameter("servo_send_ms").as_double());
     }
     // A cancel during a stream slows the tool along the path at this rate.
     this->declare_parameter("halt_decel_mm_s2", 2000.0);

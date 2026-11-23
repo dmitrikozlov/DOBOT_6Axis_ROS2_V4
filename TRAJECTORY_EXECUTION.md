@@ -117,13 +117,18 @@ MoveIt (plan_only)
      to run. In step with the feed it was ~1.8 % (t24, 2026-10-29). A command held up past its
      packet (a slow reply) delays the rest of the stream instead of being made up.
    - With `servo_cycle_tracking` (default), it paces on the controller's 4 ms motion cycle
-     instead (`cycle_clock.h`): one ServoJ right after every `servo_cycles_per_command`-th
-     block of the motion module's log port 65511, `t` = that many × 4 ms. The controller divides
-     each step by min(`t`, the gap since the previous command in whole 4 ms cycles), so the
-     feed's 6- and 7-cycle gaps make a velocity ripple at ~6.5 Hz, the arm's own mode; whole
-     6-cycle gaps remove it (2026-11-03). Field 84 of each block, the queue number being
-     executed, shows the cycle each command was taken in: one taken a cycle later than usual
-     moves the commands 1 ms earlier in the cycle, one taken early 1 ms later. 65511 is an
+     instead (`cycle_clock.h`): one ServoJ every `servo_cycles_per_command` cycles of the
+     motion module's log port 65511, `t` = that many × 4 ms. The controller divides each step
+     by min(`t`, the gap since the previous command in whole 4 ms cycles), so the feed's 6- and
+     7-cycle gaps make a velocity ripple at ~6.5 Hz, the arm's own mode; whole 6-cycle gaps
+     remove it (2026-11-03). Blocks arrive late and bunched, so the cycles come from the
+     earliest arrivals over 10 s, on the Pi's clock, and each moving command goes
+     `servo_send_ms` after its cycle's block: just after the point where the controller stops
+     taking a command in the earlier cycle, since it takes commands late now and then but
+     almost never early. Field 84 of each block, the queue number being executed, shows the
+     cycle each command was taken in; the commands of a hold after a stream sweep the cycle in
+     0.25 ms steps to measure that point, and a warning gives the value to set when it is over
+     0.5 ms from `servo_send_ms`. 65511 is an
      undocumented debug port: a stream that starts without its blocks paces on the feed, with a
      warning, and one that loses them continues on the feed with the same `t`. All of it is in
      `cycle_clock.h/.cpp` and the `cycle_clock_` branches of `TrajectoryExecutor`, to remove
@@ -194,6 +199,7 @@ Added to the `dobot_bringup_ros2` node:
 | `servo_packets_per_command` | 3 | A ServoJ right after every this many realtime packets (~8.2 ms each); `t` is that many feed periods |
 | `servo_cycle_tracking` | true | Pace on the controller's 4 ms motion cycle from its debug port 65511, falling back to the feed without it |
 | `servo_cycles_per_command` | 6 | With cycle tracking: a ServoJ every this many 4 ms cycles; `t` is that many × 4 ms |
+| `servo_send_ms` | 2.7 | With cycle tracking: moving commands this long after their cycle's block, in [0, 4) |
 | `servo_aheadtime` | 50.0 | Controller lookahead / D-term [20..100] |
 | `servo_gain` | 500.0 | Controller proportional gain [200..1000] |
 | `servo_rt_priority` | 80 | SCHED_FIFO priority of the servo thread; 0 keeps normal scheduling |
